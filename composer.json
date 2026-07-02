@@ -13,7 +13,7 @@
   ],
   "support": {
     "email": "baestmarketing@gmail.com",
-    "issues": "https://github.com/baestmarketing/craft-connect/issues",
+    "issues": "https://github.com/baestmarketing-dot/craft-connect/issues",
     "docs": "https://deon-ai.de/docs/craft"
   },
   "require": {
@@ -31,7 +31,7 @@
     "developer": "Deon AI",
     "developerUrl": "https://deon-ai.de",
     "documentationUrl": "https://deon-ai.de/docs/craft",
-    "changelogUrl": "https://raw.githubusercontent.com/baestmarketing/craft-connect/main/CHANGELOG.md",
+    "changelogUrl": "https://raw.githubusercontent.com/baestmarketing-dot/craft-connect/main/CHANGELOG.md",
     "class": "deonai\\craftconnect\\Plugin"
   }
 }
