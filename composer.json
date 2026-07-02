@@ -1,0 +1,37 @@
+{
+  "name": "deon-ai/craft-connect",
+  "description": "Deon AI Connect für Craft CMS — SEO-Fixes, KI-Sichtbarkeit, Tracking und Blog-Publishing direkt aus dem Deon AI Marketing-OS.",
+  "type": "craft-plugin",
+  "version": "0.1.0",
+  "keywords": ["craft", "cms", "craftcms", "craft-plugin", "seo", "ai", "deon"],
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Deon AI / BÄST Marketing",
+      "homepage": "https://deon-ai.de"
+    }
+  ],
+  "support": {
+    "email": "baestmarketing@gmail.com",
+    "issues": "https://github.com/baestmarketing/craft-connect/issues",
+    "docs": "https://deon-ai.de/docs/craft"
+  },
+  "require": {
+    "php": ">=8.0.2",
+    "craftcms/cms": "^4.0.0|^5.0.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "deonai\\craftconnect\\": "src/"
+    }
+  },
+  "extra": {
+    "name": "Deon AI Connect",
+    "handle": "deon-ai-connect",
+    "developer": "Deon AI",
+    "developerUrl": "https://deon-ai.de",
+    "documentationUrl": "https://deon-ai.de/docs/craft",
+    "changelogUrl": "https://raw.githubusercontent.com/baestmarketing/craft-connect/main/CHANGELOG.md",
+    "class": "deonai\\craftconnect\\Plugin"
+  }
+}

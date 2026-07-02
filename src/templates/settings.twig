@@ -1,0 +1,45 @@
+{% import '_includes/forms' as forms %}
+
+{{ forms.autosuggestField({
+    label: 'Deon AI API-Key'|t('deon-ai-connect'),
+    instructions: 'Der Key aus Deon AI → Website verknüpfen. Authentifiziert eingehende Deon-AI-Calls (Header X-Deon-Key).'|t('deon-ai-connect'),
+    id: 'apiKey', name: 'apiKey', value: settings.apiKey, suggestEnvVars: true,
+}) }}
+
+{{ forms.autosuggestField({
+    label: 'Site-ID'|t('deon-ai-connect'),
+    instructions: 'Die Deon AI Site-ID (UUID) aus dem Dashboard.'|t('deon-ai-connect'),
+    id: 'siteId', name: 'siteId', value: settings.siteId, suggestEnvVars: true,
+}) }}
+
+{{ forms.autosuggestField({
+    label: 'SDK Public Key'|t('deon-ai-connect'),
+    instructions: 'dpk_… — für Tracking & A/B-Varianten.'|t('deon-ai-connect'),
+    id: 'sdkKey', name: 'sdkKey', value: settings.sdkKey, suggestEnvVars: true,
+}) }}
+
+{{ forms.textField({
+    label: 'Verifizierungs-UUID'|t('deon-ai-connect'),
+    instructions: 'Aus dem Schritt „Domain verifizieren" — wird automatisch als Meta-Tag ausgespielt, kein Template-Edit nötig.'|t('deon-ai-connect'),
+    id: 'verificationUuid', name: 'verificationUuid', value: settings.verificationUuid,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Deon SDK automatisch einbinden'|t('deon-ai-connect'),
+    instructions: 'Injiziert das Tracking-/A-B-Script auf allen Frontend-Seiten.'|t('deon-ai-connect'),
+    id: 'injectSdk', name: 'injectSdk', on: settings.injectSdk,
+}) }}
+
+<hr>
+
+{{ forms.textField({
+    label: 'Blog-Section (Handle)'|t('deon-ai-connect'),
+    instructions: 'In dieser Section legt Deon AI generierte Artikel an.'|t('deon-ai-connect'),
+    id: 'blogSectionHandle', name: 'blogSectionHandle', value: settings.blogSectionHandle,
+}) }}
+
+{{ forms.textField({
+    label: 'Artikel-Body-Feld (Handle)'|t('deon-ai-connect'),
+    instructions: 'Rich-Text-/CKEditor-Feld, in das der Artikel-HTML geschrieben wird.'|t('deon-ai-connect'),
+    id: 'blogBodyFieldHandle', name: 'blogBodyFieldHandle', value: settings.blogBodyFieldHandle,
+}) }}
