@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 - 2026-07-10
+
+### Fixed
+- Falsche Repo-URLs in composer.json (`support.issues`, `extra.changelogUrl`) korrigiert — der 0.1.0-Tag zeigte noch auf `github.com/baestmarketing/craft-connect` statt `baestmarketing-dot/craft-connect`
+
 ## 0.1.0 - 2026-07-02
 
 ### Added
