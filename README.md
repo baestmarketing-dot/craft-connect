@@ -6,7 +6,8 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 
 - **SEO-Fixes nativ am Origin** — Title, Meta-Description, Canonical und Schema.org-Markup werden serverseitig ins ausgelieferte HTML geschrieben. Kein Client-Overlay: Googlebot **und** KI-Crawler (GPTBot, ClaudeBot, PerplexityBot) sehen die Optimierungen im rohen HTML.
 - **Automatische Einbindung** — SDK-Script (Tracking, Conversions, A/B-Varianten) und Domain-Verifizierungs-Tag werden injiziert, ohne dass Templates angepasst werden müssen.
-- **Blog-Publishing** — Deon AI legt generierte Artikel direkt als Entries in einer konfigurierbaren Section an (Entwurf oder live).
+- **robots.txt / llms.txt** — Deon AI kann KI-Crawler-Freigaben und llms.txt optional direkt am Origin ausliefern (Setting `manageRobotsLlms`).
+- **Blog-Publishing** — Deon AI legt generierte Artikel direkt als Entries an (Entwurf oder live), inkl. Featured-Image-Upload und Duplikat-Check über bestehende Entries. Section und Body-Feld können pro Request überschrieben werden (Multi-Section-Publishing).
 
 ## Installation
 
@@ -21,7 +22,7 @@ php craft plugin/install deon-ai-connect
 2. Die angezeigten Werte (API-Key, Site-ID, SDK-Key, Verifizierungs-UUID) in Craft unter **Einstellungen → Plugins → Deon AI Connect** eintragen. Tipp: als Env-Variablen (`$DEON_API_KEY` …) hinterlegen — die Felder unterstützen Env-Autosuggest.
 3. Zurück im Deon-AI-Wizard auf **Verifizieren** klicken — fertig.
 
-Für das Blog-Publishing: Section-Handle (Standard `blog`) und Body-Feld-Handle (Standard `body`) in den Plugin-Einstellungen an dein Schema anpassen.
+Für das Blog-Publishing: Section-Handle (Standard `blog`) und Body-Feld-Handle (Standard `body`) in den Plugin-Einstellungen an dein Schema anpassen. Für Featured Images zusätzlich Asset-Volume- und Bildfeld-Handle eintragen. Für robots.txt/llms.txt-Verwaltung den entsprechenden Schalter aktivieren (nur wirksam, wenn im Webroot noch keine physische robots.txt-Datei liegt).
 
 ## Anforderungen
 

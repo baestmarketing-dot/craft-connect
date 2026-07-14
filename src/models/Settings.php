@@ -27,11 +27,20 @@ class Settings extends Model
     /** Feld-Handle für den Artikel-Body (Rich-Text/CKEditor-Feld). */
     public string $blogBodyFieldHandle = 'body';
 
+    /** Volume-Handle für Bild-Uploads (Featured Images aus Deon AI). Leer = deaktiviert. */
+    public string $assetVolumeHandle = '';
+
+    /** Feld-Handle für das Featured-Image-Feld im Entry-Type. Leer = deaktiviert. */
+    public string $featuredImageFieldHandle = '';
+
+    /** robots.txt + llms.txt am Origin ausliefern (Deon AI verwaltet den Inhalt). */
+    public bool $manageRobotsLlms = false;
+
     public function defineRules(): array
     {
         return [
-            [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle'], 'string'],
-            [['injectSdk'], 'boolean'],
+            [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
+            [['injectSdk', 'manageRobotsLlms'], 'boolean'],
         ];
     }
 }

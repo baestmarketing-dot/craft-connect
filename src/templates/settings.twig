@@ -43,3 +43,23 @@
     instructions: 'Rich-Text-/CKEditor-Feld, in das der Artikel-HTML geschrieben wird.'|t('deon-ai-connect'),
     id: 'blogBodyFieldHandle', name: 'blogBodyFieldHandle', value: settings.blogBodyFieldHandle,
 }) }}
+
+{{ forms.textField({
+    label: 'Asset-Volume (Handle)'|t('deon-ai-connect'),
+    instructions: 'Volume für Bild-Uploads (Featured Images). Leer lassen, um Bild-Uploads zu deaktivieren.'|t('deon-ai-connect'),
+    id: 'assetVolumeHandle', name: 'assetVolumeHandle', value: settings.assetVolumeHandle,
+}) }}
+
+{{ forms.textField({
+    label: 'Featured-Image-Feld (Handle)'|t('deon-ai-connect'),
+    instructions: 'Asset-Feld im Entry-Type für das Titelbild. Leer lassen, um Bild-Uploads zu deaktivieren.'|t('deon-ai-connect'),
+    id: 'featuredImageFieldHandle', name: 'featuredImageFieldHandle', value: settings.featuredImageFieldHandle,
+}) }}
+
+<hr>
+
+{{ forms.lightswitchField({
+    label: 'robots.txt / llms.txt verwalten'|t('deon-ai-connect'),
+    instructions: 'Deon AI liefert robots.txt und llms.txt direkt am Origin aus. Achtung: Liegt im Webroot bereits eine physische robots.txt-Datei, greift diese Einstellung nicht — der Webserver liefert die Datei aus, bevor Craft überhaupt läuft. Datei in dem Fall entfernen.'|t('deon-ai-connect'),
+    id: 'manageRobotsLlms', name: 'manageRobotsLlms', on: settings.manageRobotsLlms,
+}) }}

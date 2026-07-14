@@ -25,7 +25,7 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.0.0';
+    public string $schemaVersion = '1.1.0';
     public bool $hasCpSettings = true;
 
     public static function config(): array
@@ -48,6 +48,17 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/seo'] = 'deon-ai-connect/api/set-seo';
                 $event->rules['deon-ai/seo-list'] = 'deon-ai-connect/api/list-seo';
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
+                $event->rules['deon-ai/entries'] = 'deon-ai-connect/api/list-entries';
+                $event->rules['deon-ai/asset'] = 'deon-ai-connect/api/upload-asset';
+                $event->rules['deon-ai/hygiene'] = 'deon-ai-connect/api/set-hygiene';
+                $event->rules['deon-ai/hygiene-list'] = 'deon-ai-connect/api/hygiene-list';
+
+                // robots.txt/llms.txt nur ausliefern, wenn explizit aktiviert — sonst
+                // würde eine leere Tabelle jede physische robots.txt-Route verdecken.
+                if ($this->getSettings()->manageRobotsLlms) {
+                    $event->rules['robots.txt'] = 'deon-ai-connect/api/robots-txt';
+                    $event->rules['llms.txt'] = 'deon-ai-connect/api/llms-txt';
+                }
             }
         );
 
