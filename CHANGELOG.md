@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2 - 2026-07-15
+
+### Changed
+- Plugin-Store-Vorbereitung: `composer.json` ohne `version`-Feld (Versionen kommen aus Git-Tags), `support.source` ergänzt; `LICENSE.md` → `LICENSE.txt`; `.github/workflows/create-release.yml` für automatische GitHub-Releases bei neuen, vom Craft Plugin Store erkannten Tags. Keine funktionale Änderung am Plugin selbst.
+
 ## 0.4.1 - 2026-07-15
 
 ### Fixed
