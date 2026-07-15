@@ -17,7 +17,10 @@ namespace deonai\craftconnect;
 use Craft;
 use craft\base\Model;
 use craft\base\Plugin as BasePlugin;
+use craft\events\PluginEvent;
 use craft\events\RegisterUrlRulesEvent;
+use craft\services\Plugins as PluginsService;
+use craft\web\Application as WebApplication;
 use craft\web\UrlManager;
 use deonai\craftconnect\models\Settings;
 use yii\base\Event;
@@ -25,8 +28,13 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.0.0';
+    public string $schemaVersion = '1.2.0';
     public bool $hasCpSettings = true;
+
+    private const BOOTSTRAP_URL = 'https://audit.deon-ai.de/api/plugin/craft/bootstrap';
+
+    /** Verhindert Endlosschleife: bootstrapFromDeonAi() speichert selbst wieder Settings. */
+    private static bool $bootstrapping = false;
 
     public static function config(): array
     {
@@ -39,6 +47,19 @@ class Plugin extends BasePlugin
     {
         parent::init();
 
+        // Ein-Key-Onboarding: Nutzer trägt nur den Connection-Key ein, der Rest
+        // (Site-ID, SDK-Key, Verifizierungs-UUID) wird beim Speichern automatisch
+        // von Deon AI abgeholt (Bootstrap) — analog zum WordPress-Plugin-Flow.
+        Event::on(
+            PluginsService::class,
+            PluginsService::EVENT_AFTER_SAVE_PLUGIN_SETTINGS,
+            function (PluginEvent $event) {
+                if ($event->plugin === $this && !self::$bootstrapping && Craft::$app instanceof WebApplication) {
+                    $this->bootstrapFromDeonAi();
+                }
+            }
+        );
+
         // REST-Routen für den Deon-AI-Worker (Auth via X-Deon-Key Header).
         Event::on(
             UrlManager::class,
@@ -48,6 +69,25 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/seo'] = 'deon-ai-connect/api/set-seo';
                 $event->rules['deon-ai/seo-list'] = 'deon-ai-connect/api/list-seo';
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
+                $event->rules['deon-ai/entries'] = 'deon-ai-connect/api/list-entries';
+                $event->rules['deon-ai/asset'] = 'deon-ai-connect/api/upload-asset';
+                $event->rules['deon-ai/hygiene'] = 'deon-ai-connect/api/set-hygiene';
+                $event->rules['deon-ai/hygiene-list'] = 'deon-ai-connect/api/hygiene-list';
+                // Rollback-Journal: Proxy-Konvention des Deon-AI-Workers (analog zum
+                // WordPress-/TYPO3-Plugin) — feste Unterpfade vor dem <id>-Catch-all,
+                // sonst würde z. B. "list" fälschlich als <id> interpretiert.
+                $event->rules['deon-ai/rollback/list'] = 'deon-ai-connect/api/rollback-list';
+                $event->rules['deon-ai/rollback/restore-point'] = 'deon-ai-connect/api/rollback-create-restore-point';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>/preview'] = 'deon-ai-connect/api/rollback-preview';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>/restore'] = 'deon-ai-connect/api/rollback-restore';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>'] = 'deon-ai-connect/api/rollback-get';
+
+                // robots.txt/llms.txt nur ausliefern, wenn explizit aktiviert — sonst
+                // würde eine leere Tabelle jede physische robots.txt-Route verdecken.
+                if ($this->getSettings()->manageRobotsLlms) {
+                    $event->rules['robots.txt'] = 'deon-ai-connect/api/robots-txt';
+                    $event->rules['llms.txt'] = 'deon-ai-connect/api/llms-txt';
+                }
             }
         );
 
@@ -77,6 +117,55 @@ class Plugin extends BasePlugin
         return Craft::$app->getView()->renderTemplate('deon-ai-connect/settings', [
             'settings' => $this->getSettings(),
         ]);
+    }
+
+    // ─── Ein-Key-Bootstrap ──────────────────────────────────────────────────
+
+    /**
+     * Holt Site-ID/SDK-Key/Verifizierungs-UUID von Deon AI ab, authentifiziert
+     * über denselben Connection-Key, den eingehende Deon-AI-Calls prüfen
+     * (X-Deon-Key). Fail-soft: schlägt der Call fehl, bleiben die Settings wie
+     * zuvor gespeichert — nur eine CP-Meldung informiert den Nutzer.
+     */
+    private function bootstrapFromDeonAi(): void
+    {
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        if (empty($settings->apiKey)) {
+            return;
+        }
+
+        try {
+            $client = Craft::createGuzzleClient(['timeout' => 10]);
+            $response = $client->request('GET', self::BOOTSTRAP_URL, [
+                'headers' => ['X-Deon-Key' => $settings->apiKey],
+                'http_errors' => false,
+            ]);
+            $body = json_decode((string)$response->getBody(), true);
+
+            if ($response->getStatusCode() !== 200 || empty($body['ok'])) {
+                Craft::warning('deon-ai-connect bootstrap failed: HTTP ' . $response->getStatusCode(), __METHOD__);
+                Craft::$app->getSession()->setError('Deon AI: Verbindung fehlgeschlagen — Connection-Key prüfen.');
+                return;
+            }
+
+            self::$bootstrapping = true;
+            try {
+                Craft::$app->getPlugins()->savePluginSettings($this, [
+                    'siteId' => (string)($body['site_id'] ?? $settings->siteId),
+                    'sdkKey' => (string)($body['sdk_public_key'] ?? $settings->sdkKey),
+                    'verificationUuid' => (string)($body['verification_uuid'] ?? $settings->verificationUuid),
+                ]);
+            } finally {
+                self::$bootstrapping = false;
+            }
+
+            Craft::$app->getSession()->setNotice('Deon AI erfolgreich verbunden (Site-ID: ' . ($body['site_id'] ?? '?') . ').');
+        } catch (\Throwable $e) {
+            // Fail-soft: Netzwerkfehler o. Ä. dürfen das Speichern der Settings nie verhindern.
+            Craft::warning('deon-ai-connect bootstrap error: ' . $e->getMessage(), __METHOD__);
+            Craft::$app->getSession()->setError('Deon AI: Verbindung fehlgeschlagen — ' . $e->getMessage());
+        }
     }
 
     // ─── Frontend-Patching ────────────────────────────────────────────────

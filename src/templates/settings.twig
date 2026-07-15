@@ -1,28 +1,20 @@
 {% import '_includes/forms' as forms %}
 
 {{ forms.autosuggestField({
-    label: 'Deon AI API-Key'|t('deon-ai-connect'),
-    instructions: 'Der Key aus Deon AI → Website verknüpfen. Authentifiziert eingehende Deon-AI-Calls (Header X-Deon-Key).'|t('deon-ai-connect'),
+    label: 'Deon AI Connection-Key'|t('deon-ai-connect'),
+    instructions: 'Der Key aus Deon AI → Website verknüpfen. Authentifiziert eingehende Deon-AI-Calls (Header X-Deon-Key) UND den einmaligen Verbindungsaufbau beim Speichern — Site-ID, SDK-Key und Verifizierungs-UUID werden danach automatisch von Deon AI abgeholt, kein weiteres Feld nötig.'|t('deon-ai-connect'),
     id: 'apiKey', name: 'apiKey', value: settings.apiKey, suggestEnvVars: true,
 }) }}
 
-{{ forms.autosuggestField({
-    label: 'Site-ID'|t('deon-ai-connect'),
-    instructions: 'Die Deon AI Site-ID (UUID) aus dem Dashboard.'|t('deon-ai-connect'),
-    id: 'siteId', name: 'siteId', value: settings.siteId, suggestEnvVars: true,
-}) }}
-
-{{ forms.autosuggestField({
-    label: 'SDK Public Key'|t('deon-ai-connect'),
-    instructions: 'dpk_… — für Tracking & A/B-Varianten.'|t('deon-ai-connect'),
-    id: 'sdkKey', name: 'sdkKey', value: settings.sdkKey, suggestEnvVars: true,
-}) }}
-
-{{ forms.textField({
-    label: 'Verifizierungs-UUID'|t('deon-ai-connect'),
-    instructions: 'Aus dem Schritt „Domain verifizieren" — wird automatisch als Meta-Tag ausgespielt, kein Template-Edit nötig.'|t('deon-ai-connect'),
-    id: 'verificationUuid', name: 'verificationUuid', value: settings.verificationUuid,
-}) }}
+{% if settings.siteId %}
+    <div style="margin: -8px 0 24px;">
+        <p style="color: #2e7d32;">✓ {{ 'Verbunden — Site-ID: {siteId}'|t('deon-ai-connect', {siteId: settings.siteId}) }}</p>
+    </div>
+{% elseif settings.apiKey %}
+    <div style="margin: -8px 0 24px;">
+        <p style="color: #b26a00;">{{ 'Noch nicht verbunden — beim Speichern wird die Verbindung automatisch aufgebaut.'|t('deon-ai-connect') }}</p>
+    </div>
+{% endif %}
 
 {{ forms.lightswitchField({
     label: 'Deon SDK automatisch einbinden'|t('deon-ai-connect'),
@@ -42,4 +34,24 @@
     label: 'Artikel-Body-Feld (Handle)'|t('deon-ai-connect'),
     instructions: 'Rich-Text-/CKEditor-Feld, in das der Artikel-HTML geschrieben wird.'|t('deon-ai-connect'),
     id: 'blogBodyFieldHandle', name: 'blogBodyFieldHandle', value: settings.blogBodyFieldHandle,
+}) }}
+
+{{ forms.textField({
+    label: 'Asset-Volume (Handle)'|t('deon-ai-connect'),
+    instructions: 'Volume für Bild-Uploads (Featured Images). Leer lassen, um Bild-Uploads zu deaktivieren.'|t('deon-ai-connect'),
+    id: 'assetVolumeHandle', name: 'assetVolumeHandle', value: settings.assetVolumeHandle,
+}) }}
+
+{{ forms.textField({
+    label: 'Featured-Image-Feld (Handle)'|t('deon-ai-connect'),
+    instructions: 'Asset-Feld im Entry-Type für das Titelbild. Leer lassen, um Bild-Uploads zu deaktivieren.'|t('deon-ai-connect'),
+    id: 'featuredImageFieldHandle', name: 'featuredImageFieldHandle', value: settings.featuredImageFieldHandle,
+}) }}
+
+<hr>
+
+{{ forms.lightswitchField({
+    label: 'robots.txt / llms.txt verwalten'|t('deon-ai-connect'),
+    instructions: 'Deon AI liefert robots.txt und llms.txt direkt am Origin aus. Achtung: Liegt im Webroot bereits eine physische robots.txt-Datei, greift diese Einstellung nicht — der Webserver liefert die Datei aus, bevor Craft überhaupt läuft. Datei in dem Fall entfernen.'|t('deon-ai-connect'),
+    id: 'manageRobotsLlms', name: 'manageRobotsLlms', on: settings.manageRobotsLlms,
 }) }}

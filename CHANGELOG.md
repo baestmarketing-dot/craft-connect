@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0 - 2026-07-15
+
+### Changed
+- Ein-Key-Onboarding: Setup verlangt jetzt nur noch den "Deon AI Connection-Key" statt vier separaten Feldern (API-Key, Site-ID, SDK-Key, Verifizierungs-UUID). Beim Speichern holt das Plugin Site-ID, SDK-Key und Verifizierungs-UUID automatisch per Bootstrap-Call (`GET https://audit.deon-ai.de/api/plugin/craft/bootstrap`, authentifiziert über denselben Key) — analog zum WordPress-Plugin-Flow. Fail-soft: schlägt der Bootstrap fehl, bleiben gespeicherte Settings unverändert, nur eine CP-Meldung informiert.
+
+## 0.3.0 - 2026-07-15
+
+### Added
+- Änderungsprotokoll mit Rollback: jede Deon-AI-Änderung (SEO-Override, Entry, robots.txt/llms.txt) speichert automatisch den Vorher-Zustand — kein separater Backup-Schritt, funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig)
+- `/deon-ai/rollback/list`, `/rollback/<rb_id>`, `/rollback/<rb_id>/preview`, `/rollback/<rb_id>/restore` — folgt derselben Proxy-Konvention wie das WordPress-/TYPO3-Plugin, erscheint damit im bestehenden "Änderungs-Journal"-Tab des Dashboards statt eines eigenen, unverbundenen Endpoints
+- `/deon-ai/rollback/restore-point` — kompletter Sicherungspunkt (Snapshot aller SEO-Overrides, robots.txt/llms.txt, Entries) als reines SQL-Snapshot
+- Konflikt-Erkennung: `restore` bricht ab (HTTP 409), wenn der Live-Zustand seit der Deon-AI-Änderung manuell verändert wurde — überschreibbar mit `force: true`
+- Alle schreibenden Endpoints (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) akzeptieren optional `note` und geben `rollback_id` in der Antwort zurück
+
+## 0.2.0 - 2026-07-14
+
+### Added
+- robots.txt/llms.txt-Verwaltung am Origin: neues Setting `manageRobotsLlms`, Endpoints `/deon-ai/hygiene` (setzen) und `/deon-ai/hygiene-list` (auslesen), ausgeliefert über `/robots.txt` und `/llms.txt`
+- `/deon-ai/entries` — bestehende Entries einer Section auflisten (Duplikat-Check vor dem Anlegen)
+- `/deon-ai/asset` — Bild-Upload (URL oder Base64) für Featured Images, Settings `assetVolumeHandle` + `featuredImageFieldHandle`
+- `/deon-ai/entry` unterstützt jetzt `section`/`body_field`-Override sowie `image_url`/`asset_id` für Featured Images — Multi-Section-Publishing ohne separate Plugin-Installation
+
+### Changed
+- Feature-Parität zum WordPress-Plugin (AideonConnect) angenähert: SEO-Hygiene (robots/llms) und erweiterte Content-API waren zuvor WP/TYPO3-exklusiv
+
 ## 0.1.1 - 2026-07-10
 
 ### Fixed
