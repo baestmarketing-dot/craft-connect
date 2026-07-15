@@ -151,11 +151,16 @@ class Plugin extends BasePlugin
 
             self::$bootstrapping = true;
             try {
-                Craft::$app->getPlugins()->savePluginSettings($this, [
+                // WICHTIG: savePluginSettings() merged NICHT mit den bestehenden
+                // Settings — ein Teil-Array (nur siteId/sdkKey/verificationUuid)
+                // hätte apiKey & alle anderen Felder auf ihre Defaults zurückgesetzt.
+                // Deshalb immer das komplette aktuelle Settings-Array mitschicken.
+                $updated = array_merge($settings->getAttributes(), [
                     'siteId' => (string)($body['site_id'] ?? $settings->siteId),
                     'sdkKey' => (string)($body['sdk_public_key'] ?? $settings->sdkKey),
                     'verificationUuid' => (string)($body['verification_uuid'] ?? $settings->verificationUuid),
                 ]);
+                Craft::$app->getPlugins()->savePluginSettings($this, $updated);
             } finally {
                 self::$bootstrapping = false;
             }

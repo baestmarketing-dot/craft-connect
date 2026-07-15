@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-07-15
+
+### Fixed
+- **Kritisch:** Bootstrap-Save (v0.4.0) hat beim Speichern nur `siteId`/`sdkKey`/`verificationUuid` an `savePluginSettings()` übergeben — Craft merged dabei nicht mit den bestehenden Settings, wodurch `apiKey` (und alle anderen Felder) auf ihre Defaults zurückgesetzt wurden. Der Connection-Key erschien danach leer, obwohl die Verbindung erfolgreich war. Betroffene Installationen (Key wurde geleert) müssen den Connection-Key einmal neu eintragen; ab diesem Fix bleibt er erhalten.
+
 ## 0.4.0 - 2026-07-15
 
 ### Changed
