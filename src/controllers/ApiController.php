@@ -94,7 +94,9 @@ class ApiController extends Controller
             $db->createCommand()->insert($table, $columns)->execute();
         }
 
-        return $this->asJson(['ok' => true, 'uri' => $uri, 'applied' => array_keys(array_filter([
+        $changeId = $this->logChange('seo_override', $uri, $existing ?: null, $columns, isset($body['note']) ? (string)$body['note'] : null);
+
+        return $this->asJson(['ok' => true, 'uri' => $uri, 'change_id' => $changeId, 'applied' => array_keys(array_filter([
             'title' => isset($body['title']),
             'meta_description' => isset($body['meta_description']),
             'canonical' => isset($body['canonical']),
@@ -150,7 +152,21 @@ class ApiController extends Controller
         if (!empty($body['entry_id'])) {
             $entry = Entry::find()->id((int)$body['entry_id'])->status(null)->one();
         }
-        if (!$entry) {
+        $isNewEntry = !$entry;
+        $beforeState = null;
+        if (!$isNewEntry) {
+            $beforeState = [
+                'title' => $entry->title,
+                'slug' => $entry->slug,
+                'enabled' => $entry->enabled,
+                'bodyFieldHandle' => $bodyFieldHandle,
+                'bodyValue' => $this->safeFieldString($entry, $bodyFieldHandle),
+            ];
+            if (!empty($settings->featuredImageFieldHandle)) {
+                $beforeState['imageFieldHandle'] = $settings->featuredImageFieldHandle;
+                $beforeState['imageAssetIds'] = $this->safeFieldAssetIds($entry, $settings->featuredImageFieldHandle);
+            }
+        } else {
             $entry = new Entry();
             $entry->sectionId = $section->id;
             $entryTypes = $section->getEntryTypes();
@@ -199,9 +215,23 @@ class ApiController extends Controller
             return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
         }
 
+        $afterState = [
+            'title' => $entry->title,
+            'slug' => $entry->slug,
+            'enabled' => $entry->enabled,
+            'bodyFieldHandle' => $bodyFieldHandle,
+            'bodyValue' => $this->safeFieldString($entry, $bodyFieldHandle),
+        ];
+        if (!empty($settings->featuredImageFieldHandle)) {
+            $afterState['imageFieldHandle'] = $settings->featuredImageFieldHandle;
+            $afterState['imageAssetIds'] = $this->safeFieldAssetIds($entry, $settings->featuredImageFieldHandle);
+        }
+        $changeId = $this->logChange('entry', (string)$entry->id, $beforeState, $afterState, isset($body['note']) ? (string)$body['note'] : null);
+
         return $this->asJson([
             'ok' => true,
             'entry_id' => $entry->id,
+            'change_id' => $changeId,
             'url' => $entry->getUrl(),
             'status' => $entry->enabled ? 'live' : 'disabled',
         ]);
@@ -327,7 +357,9 @@ class ApiController extends Controller
             ])->execute();
         }
 
-        return $this->asJson(['ok' => true, 'type' => $type]);
+        $changeId = $this->logChange('hygiene', $type, $existing ?: null, ['content' => $content], isset($body['note']) ? (string)$body['note'] : null);
+
+        return $this->asJson(['ok' => true, 'type' => $type, 'change_id' => $changeId]);
     }
 
     /** GET /deon-ai/hygiene-list — aktuelle robots.txt/llms.txt Inhalte (für den Editor). */
@@ -339,6 +371,200 @@ class ApiController extends Controller
             ->from('{{%deonai_seo_hygiene}}')
             ->all();
         return $this->asJson(['ok' => true, 'items' => $rows]);
+    }
+
+    /**
+     * GET /deon-ai/changes — Änderungsprotokoll (für Rollback-UI in Deon AI).
+     * Query: ?target_type=&limit=
+     */
+    public function actionListChanges(): Response
+    {
+        $this->requireDeonKey();
+        $query = (new \craft\db\Query())
+            ->from('{{%deonai_change_log}}')
+            ->orderBy(['dateCreated' => SORT_DESC])
+            ->limit(min((int)(Craft::$app->getRequest()->getQueryParam('limit') ?: 100), 500));
+
+        $targetType = Craft::$app->getRequest()->getQueryParam('target_type');
+        if ($targetType) {
+            $query->andWhere(['targetType' => (string)$targetType]);
+        }
+
+        $rows = $query->all();
+        foreach ($rows as &$row) {
+            $row['before'] = $row['beforeJson'] !== null ? json_decode($row['beforeJson'], true) : null;
+            $row['after'] = json_decode($row['afterJson'], true);
+            unset($row['beforeJson'], $row['afterJson']);
+        }
+        unset($row);
+
+        return $this->asJson(['ok' => true, 'changes' => $rows]);
+    }
+
+    /**
+     * POST /deon-ai/rollback — eine protokollierte Änderung rückgängig machen.
+     * Body: { change_id }
+     */
+    public function actionRollback(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $changeId = (int)($body['change_id'] ?? 0);
+        if (!$changeId) {
+            return $this->asJson(['ok' => false, 'error' => 'change_id required'])->setStatusCode(400);
+        }
+
+        $log = (new \craft\db\Query())->from('{{%deonai_change_log}}')->where(['id' => $changeId])->one();
+        if (!$log) {
+            return $this->asJson(['ok' => false, 'error' => 'change_not_found'])->setStatusCode(404);
+        }
+        if ($log['rolledBack']) {
+            return $this->asJson(['ok' => false, 'error' => 'already_rolled_back'])->setStatusCode(409);
+        }
+
+        $before = $log['beforeJson'] !== null ? json_decode($log['beforeJson'], true) : null;
+
+        try {
+            $result = match ($log['targetType']) {
+                'seo_override' => $this->rollbackSeoOverride($log['targetKey'], $before),
+                'hygiene' => $this->rollbackHygiene($log['targetKey'], $before),
+                'entry' => $this->rollbackEntry($log['targetKey'], $before),
+                default => ['ok' => false, 'error' => 'unknown_target_type'],
+            };
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'rollback_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+
+        if (!$result['ok']) {
+            return $this->asJson($result)->setStatusCode(422);
+        }
+
+        Craft::$app->getDb()->createCommand()->update('{{%deonai_change_log}}', [
+            'rolledBack' => true,
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['id' => $changeId])->execute();
+
+        return $this->asJson(array_merge(['ok' => true, 'change_id' => $changeId, 'target_type' => $log['targetType'], 'target_key' => $log['targetKey']], $result));
+    }
+
+    private function rollbackSeoOverride(string $uri, ?array $before): array
+    {
+        $db = Craft::$app->getDb();
+        $table = '{{%deonai_seo_overrides}}';
+        if ($before === null) {
+            $db->createCommand()->delete($table, ['uri' => $uri])->execute();
+            return ['ok' => true, 'action' => 'deleted'];
+        }
+        $db->createCommand()->update($table, [
+            'title' => $before['title'] ?? null,
+            'metaDescription' => $before['metaDescription'] ?? null,
+            'canonical' => $before['canonical'] ?? null,
+            'schemaJson' => $before['schemaJson'] ?? null,
+            'enabled' => $before['enabled'] ?? true,
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['uri' => $uri])->execute();
+        return ['ok' => true, 'action' => 'restored'];
+    }
+
+    private function rollbackHygiene(string $type, ?array $before): array
+    {
+        $db = Craft::$app->getDb();
+        $table = '{{%deonai_seo_hygiene}}';
+        if ($before === null) {
+            $db->createCommand()->delete($table, ['type' => $type])->execute();
+            return ['ok' => true, 'action' => 'deleted'];
+        }
+        $db->createCommand()->update($table, [
+            'content' => $before['content'] ?? '',
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['type' => $type])->execute();
+        return ['ok' => true, 'action' => 'restored'];
+    }
+
+    private function rollbackEntry(string $entryId, ?array $before): array
+    {
+        $entry = Entry::find()->id((int)$entryId)->status(null)->one();
+        if (!$entry) {
+            return ['ok' => false, 'error' => 'entry_no_longer_exists'];
+        }
+
+        if ($before === null) {
+            // Entry wurde von Deon AI neu angelegt — Rollback = zurück in den Papierkorb
+            // (Craft löscht Entries standardmäßig weich, nicht endgültig).
+            if (!Craft::$app->getElements()->deleteElement($entry)) {
+                return ['ok' => false, 'error' => 'delete_failed'];
+            }
+            return ['ok' => true, 'action' => 'deleted'];
+        }
+
+        $entry->title = (string)($before['title'] ?? $entry->title);
+        if (!empty($before['slug'])) {
+            $entry->slug = (string)$before['slug'];
+        }
+        $entry->enabled = (bool)($before['enabled'] ?? $entry->enabled);
+
+        if (!empty($before['bodyFieldHandle'])) {
+            try {
+                $entry->setFieldValue((string)$before['bodyFieldHandle'], $before['bodyValue'] ?? '');
+            } catch (\Throwable $e) {
+                // Feld existiert nicht mehr — restlichen Rollback trotzdem durchführen.
+            }
+        }
+        if (!empty($before['imageFieldHandle'])) {
+            try {
+                $entry->setFieldValue((string)$before['imageFieldHandle'], $before['imageAssetIds'] ?? []);
+            } catch (\Throwable $e) {
+                // Feld existiert nicht mehr — restlichen Rollback trotzdem durchführen.
+            }
+        }
+
+        if (!Craft::$app->getElements()->saveElement($entry)) {
+            return ['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()];
+        }
+        return ['ok' => true, 'action' => 'restored'];
+    }
+
+    /** Protokolliert eine Änderung (Vorher-/Nachher-Zustand) fürs Rollback. Gibt die change_id zurück. */
+    private function logChange(string $targetType, string $targetKey, ?array $before, array $after, ?string $note = null): int
+    {
+        $db = Craft::$app->getDb();
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        $db->createCommand()->insert('{{%deonai_change_log}}', [
+            'targetType' => $targetType,
+            'targetKey' => mb_substr($targetKey, 0, 255),
+            'beforeJson' => $before === null ? null : json_encode($before, JSON_UNESCAPED_UNICODE),
+            'afterJson' => json_encode($after, JSON_UNESCAPED_UNICODE),
+            'note' => $note !== null ? mb_substr($note, 0, 500) : null,
+            'rolledBack' => false,
+            'dateCreated' => $now,
+            'dateUpdated' => $now,
+            'uid' => StringHelper::UUID(),
+        ])->execute();
+        return (int)$db->getLastInsertID();
+    }
+
+    /** Best-effort String-Snapshot eines Feldwerts fürs Änderungsprotokoll (fail-soft). */
+    private function safeFieldString(Entry $entry, string $fieldHandle): string
+    {
+        try {
+            $value = $entry->getFieldValue($fieldHandle);
+            return (string)$value;
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
+    /** Best-effort Asset-ID-Liste eines Bild-Feldwerts fürs Änderungsprotokoll (fail-soft). */
+    private function safeFieldAssetIds(Entry $entry, string $fieldHandle): array
+    {
+        try {
+            $value = $entry->getFieldValue($fieldHandle);
+            return method_exists($value, 'ids') ? $value->ids() : [];
+        } catch (\Throwable $e) {
+            return [];
+        }
     }
 
     /** GET /robots.txt — nur aktiv, wenn Plugin-Setting manageRobotsLlms an ist. */

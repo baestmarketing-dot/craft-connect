@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-07-15
+
+### Added
+- Änderungsprotokoll mit Rollback: jede Deon-AI-Änderung (SEO-Override, Entry, robots.txt/llms.txt) speichert automatisch den Vorher-Zustand — kein separater Backup-Schritt, funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig)
+- `/deon-ai/changes` — Änderungsprotokoll auflisten (`?target_type=&limit=`)
+- `/deon-ai/rollback` — eine Änderung per `change_id` rückgängig machen; neu angelegte Entries wandern dabei in den Craft-Papierkorb (weiches Löschen, nicht endgültig)
+- Alle schreibenden Endpoints (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) akzeptieren optional `note` und geben `change_id` in der Antwort zurück
+
 ## 0.2.0 - 2026-07-14
 
 ### Added

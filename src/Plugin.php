@@ -25,7 +25,7 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.1.0';
+    public string $schemaVersion = '1.2.0';
     public bool $hasCpSettings = true;
 
     public static function config(): array
@@ -52,6 +52,8 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/asset'] = 'deon-ai-connect/api/upload-asset';
                 $event->rules['deon-ai/hygiene'] = 'deon-ai-connect/api/set-hygiene';
                 $event->rules['deon-ai/hygiene-list'] = 'deon-ai-connect/api/hygiene-list';
+                $event->rules['deon-ai/changes'] = 'deon-ai-connect/api/list-changes';
+                $event->rules['deon-ai/rollback'] = 'deon-ai-connect/api/rollback';
 
                 // robots.txt/llms.txt nur ausliefern, wenn explizit aktiviert — sonst
                 // würde eine leere Tabelle jede physische robots.txt-Route verdecken.
