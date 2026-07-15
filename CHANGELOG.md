@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 - 2026-07-15
+
+### Changed
+- Ein-Key-Onboarding: Setup verlangt jetzt nur noch den "Deon AI Connection-Key" statt vier separaten Feldern (API-Key, Site-ID, SDK-Key, Verifizierungs-UUID). Beim Speichern holt das Plugin Site-ID, SDK-Key und Verifizierungs-UUID automatisch per Bootstrap-Call (`GET https://audit.deon-ai.de/api/plugin/craft/bootstrap`, authentifiziert über denselben Key) — analog zum WordPress-Plugin-Flow. Fail-soft: schlägt der Bootstrap fehl, bleiben gespeicherte Settings unverändert, nur eine CP-Meldung informiert.
+
 ## 0.3.0 - 2026-07-15
 
 ### Added

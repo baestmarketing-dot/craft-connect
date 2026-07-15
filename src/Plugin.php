@@ -17,7 +17,10 @@ namespace deonai\craftconnect;
 use Craft;
 use craft\base\Model;
 use craft\base\Plugin as BasePlugin;
+use craft\events\PluginEvent;
 use craft\events\RegisterUrlRulesEvent;
+use craft\services\Plugins as PluginsService;
+use craft\web\Application as WebApplication;
 use craft\web\UrlManager;
 use deonai\craftconnect\models\Settings;
 use yii\base\Event;
@@ -27,6 +30,11 @@ class Plugin extends BasePlugin
 {
     public string $schemaVersion = '1.2.0';
     public bool $hasCpSettings = true;
+
+    private const BOOTSTRAP_URL = 'https://audit.deon-ai.de/api/plugin/craft/bootstrap';
+
+    /** Verhindert Endlosschleife: bootstrapFromDeonAi() speichert selbst wieder Settings. */
+    private static bool $bootstrapping = false;
 
     public static function config(): array
     {
@@ -38,6 +46,19 @@ class Plugin extends BasePlugin
     public function init(): void
     {
         parent::init();
+
+        // Ein-Key-Onboarding: Nutzer trägt nur den Connection-Key ein, der Rest
+        // (Site-ID, SDK-Key, Verifizierungs-UUID) wird beim Speichern automatisch
+        // von Deon AI abgeholt (Bootstrap) — analog zum WordPress-Plugin-Flow.
+        Event::on(
+            PluginsService::class,
+            PluginsService::EVENT_AFTER_SAVE_PLUGIN_SETTINGS,
+            function (PluginEvent $event) {
+                if ($event->plugin === $this && !self::$bootstrapping && Craft::$app instanceof WebApplication) {
+                    $this->bootstrapFromDeonAi();
+                }
+            }
+        );
 
         // REST-Routen für den Deon-AI-Worker (Auth via X-Deon-Key Header).
         Event::on(
@@ -96,6 +117,55 @@ class Plugin extends BasePlugin
         return Craft::$app->getView()->renderTemplate('deon-ai-connect/settings', [
             'settings' => $this->getSettings(),
         ]);
+    }
+
+    // ─── Ein-Key-Bootstrap ──────────────────────────────────────────────────
+
+    /**
+     * Holt Site-ID/SDK-Key/Verifizierungs-UUID von Deon AI ab, authentifiziert
+     * über denselben Connection-Key, den eingehende Deon-AI-Calls prüfen
+     * (X-Deon-Key). Fail-soft: schlägt der Call fehl, bleiben die Settings wie
+     * zuvor gespeichert — nur eine CP-Meldung informiert den Nutzer.
+     */
+    private function bootstrapFromDeonAi(): void
+    {
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        if (empty($settings->apiKey)) {
+            return;
+        }
+
+        try {
+            $client = Craft::createGuzzleClient(['timeout' => 10]);
+            $response = $client->request('GET', self::BOOTSTRAP_URL, [
+                'headers' => ['X-Deon-Key' => $settings->apiKey],
+                'http_errors' => false,
+            ]);
+            $body = json_decode((string)$response->getBody(), true);
+
+            if ($response->getStatusCode() !== 200 || empty($body['ok'])) {
+                Craft::warning('deon-ai-connect bootstrap failed: HTTP ' . $response->getStatusCode(), __METHOD__);
+                Craft::$app->getSession()->setError('Deon AI: Verbindung fehlgeschlagen — Connection-Key prüfen.');
+                return;
+            }
+
+            self::$bootstrapping = true;
+            try {
+                Craft::$app->getPlugins()->savePluginSettings($this, [
+                    'siteId' => (string)($body['site_id'] ?? $settings->siteId),
+                    'sdkKey' => (string)($body['sdk_public_key'] ?? $settings->sdkKey),
+                    'verificationUuid' => (string)($body['verification_uuid'] ?? $settings->verificationUuid),
+                ]);
+            } finally {
+                self::$bootstrapping = false;
+            }
+
+            Craft::$app->getSession()->setNotice('Deon AI erfolgreich verbunden (Site-ID: ' . ($body['site_id'] ?? '?') . ').');
+        } catch (\Throwable $e) {
+            // Fail-soft: Netzwerkfehler o. Ä. dürfen das Speichern der Settings nie verhindern.
+            Craft::warning('deon-ai-connect bootstrap error: ' . $e->getMessage(), __METHOD__);
+            Craft::$app->getSession()->setError('Deon AI: Verbindung fehlgeschlagen — ' . $e->getMessage());
+        }
     }
 
     // ─── Frontend-Patching ────────────────────────────────────────────────

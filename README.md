@@ -33,8 +33,9 @@ So bleibt die Seite live erreichbar, falls eine Migration fehlschlägt — der F
 ## Einrichtung
 
 1. In [Deon AI](https://audit.deon-ai.de) → **Website verknüpfen** → Plattform **Craft CMS** wählen.
-2. Die angezeigten Werte (API-Key, Site-ID, SDK-Key, Verifizierungs-UUID) in Craft unter **Einstellungen → Plugins → Deon AI Connect** eintragen. Tipp: als Env-Variablen (`$DEON_API_KEY` …) hinterlegen — die Felder unterstützen Env-Autosuggest.
-3. Zurück im Deon-AI-Wizard auf **Verifizieren** klicken — fertig.
+2. Den angezeigten **Connection-Key** in Craft unter **Einstellungen → Plugins → Deon AI Connect** eintragen (einziges Pflichtfeld — Tipp: als Env-Variable hinterlegen, das Feld unterstützt Env-Autosuggest) und speichern.
+3. Beim Speichern holt sich das Plugin automatisch Site-ID, SDK-Key und Verifizierungs-UUID von Deon AI ab (Bootstrap-Call, authentifiziert über denselben Key) — die Einstellungsseite zeigt danach "✓ Verbunden — Site-ID: …". Schlägt das fehl (z. B. falscher Key), bleibt eine Meldung im Control Panel stehen; die restlichen Settings gehen dabei nicht verloren.
+4. Zurück im Deon-AI-Wizard auf **Verifizieren** klicken — fertig.
 
 Für das Blog-Publishing: Section-Handle (Standard `blog`) und Body-Feld-Handle (Standard `body`) in den Plugin-Einstellungen an dein Schema anpassen. Für Featured Images zusätzlich Asset-Volume- und Bildfeld-Handle eintragen. Für robots.txt/llms.txt-Verwaltung den entsprechenden Schalter aktivieren (nur wirksam, wenn im Webroot noch keine physische robots.txt-Datei liegt).
 

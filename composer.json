@@ -2,7 +2,7 @@
   "name": "deon-ai/craft-connect",
   "description": "Deon AI Connect für Craft CMS — SEO-Fixes, KI-Sichtbarkeit, Tracking und Blog-Publishing direkt aus dem Deon AI Marketing-OS.",
   "type": "craft-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "keywords": ["craft", "cms", "craftcms", "craft-plugin", "seo", "ai", "deon"],
   "license": "MIT",
   "authors": [
