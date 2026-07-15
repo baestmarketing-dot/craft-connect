@@ -40,15 +40,19 @@ Für das Blog-Publishing: Section-Handle (Standard `blog`) und Body-Feld-Handle 
 
 ## Änderungsprotokoll & Rollback
 
-Jeder schreibende Endpoint (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) speichert vor jeder Änderung automatisch den bisherigen Zustand in einer eigenen Protokoll-Tabelle und gibt eine `change_id` zurück. Das ist **keine separate Backup-Aktion**, die vergessen oder übersprungen werden könnte — das Protokollieren passiert atomar mit der Änderung selbst, von der allerersten Aktion an.
+Jeder schreibende Endpoint (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) speichert vor jeder Änderung automatisch den bisherigen Zustand und gibt eine `rollback_id` (Format `rb_123`) zurück. Das ist **keine separate Backup-Aktion**, die vergessen oder übersprungen werden könnte — das Protokollieren passiert atomar mit der Änderung selbst, von der allerersten Aktion an.
 
-- `GET /deon-ai/changes` — Protokoll auflisten (`?target_type=&limit=`), inkl. Vorher-/Nachher-Zustand
-- `POST /deon-ai/rollback` — Body `{ "change_id": 123 }`, macht die Änderung rückgängig:
+Die Endpoints folgen derselben `/rollback/*`-Konvention wie das WordPress-/TYPO3-Plugin, damit sie im bestehenden "Änderungs-Journal"-Tab des Deon-AI-Dashboards erscheinen (der Worker leitet dorthin 1:1 durch):
+
+- `GET /deon-ai/rollback/list` (`?limit=`) — Journal auflisten
+- `GET /deon-ai/rollback/<rb_id>` — einzelnen Eintrag abrufen
+- `POST /deon-ai/rollback/<rb_id>/preview` — zeigt, was ein Rollback wiederherstellen würde (bricht bei erkanntem Konflikt ab, wenn der Live-Zustand seit der Änderung manuell verändert wurde)
+- `POST /deon-ai/rollback/<rb_id>/restore` (optional Body `{ "force": true }`, um einen Konflikt zu überschreiben) — macht die Änderung rückgängig:
   - SEO-Override/robots.txt/llms.txt: alter Inhalt wird wiederhergestellt (oder die Zeile gelöscht, falls sie vorher nicht existierte)
   - Entry: Titel/Slug/Status/Body/Featured Image werden zurückgesetzt — war der Entry neu von Deon AI angelegt, wandert er stattdessen in den Craft-Papierkorb (weiches Löschen, jederzeit wiederherstellbar)
-- Optional bei jedem Schreibaufruf ein `note`-Feld mitgeben (Freitext, z. B. "Grund der Änderung") — erscheint im Protokoll
+- `POST /deon-ai/rollback/restore-point` (Body `{ "label"? }`) — kompletter Sicherungspunkt: Snapshot aller aktuell verwalteten SEO-Overrides, robots.txt/llms.txt-Inhalte und Blog-Entries als ein wiederherstellbarer Punkt. Das ist die "einmal alles gesichert, bevor sich was ändert"-Aktion — als reines SQL-Snapshot, kein `shell_exec`/`mysqldump` nötig.
 
-Das deckt gezielt alles ab, was Deon AI selbst anfasst. Für einen kompletten Datenbank-Snapshot (auch für Dinge außerhalb des Plugin-Zugriffs) bleibt zusätzlich Craft's eigenes `php craft db/backup` empfehlenswert — das braucht allerdings `mysqldump`/`pg_dump` per `shell_exec`, was auf manchen Shared-Hosting-Umgebungen gesperrt ist.
+Optional bei jedem Schreibaufruf ein `note`-Feld mitgeben (Freitext, z. B. "Grund der Änderung") — erscheint im Protokoll. Für einen kompletten Datenbank-Snapshot außerhalb dessen, was das Plugin selbst anfasst, bleibt zusätzlich Craft's eigenes `php craft db/backup` empfehlenswert — das braucht allerdings `mysqldump`/`pg_dump` per `shell_exec`, was auf manchen Shared-Hosting-Umgebungen gesperrt ist.
 
 ## Sicherheit
 

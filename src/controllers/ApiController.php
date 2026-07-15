@@ -96,7 +96,7 @@ class ApiController extends Controller
 
         $changeId = $this->logChange('seo_override', $uri, $existing ?: null, $columns, isset($body['note']) ? (string)$body['note'] : null);
 
-        return $this->asJson(['ok' => true, 'uri' => $uri, 'change_id' => $changeId, 'applied' => array_keys(array_filter([
+        return $this->asJson(['ok' => true, 'uri' => $uri, 'rollback_id' => 'rb_' . $changeId, 'applied' => array_keys(array_filter([
             'title' => isset($body['title']),
             'meta_description' => isset($body['meta_description']),
             'canonical' => isset($body['canonical']),
@@ -231,7 +231,7 @@ class ApiController extends Controller
         return $this->asJson([
             'ok' => true,
             'entry_id' => $entry->id,
-            'change_id' => $changeId,
+            'rollback_id' => 'rb_' . $changeId,
             'url' => $entry->getUrl(),
             'status' => $entry->enabled ? 'live' : 'disabled',
         ]);
@@ -359,7 +359,7 @@ class ApiController extends Controller
 
         $changeId = $this->logChange('hygiene', $type, $existing ?: null, ['content' => $content], isset($body['note']) ? (string)$body['note'] : null);
 
-        return $this->asJson(['ok' => true, 'type' => $type, 'change_id' => $changeId]);
+        return $this->asJson(['ok' => true, 'type' => $type, 'rollback_id' => 'rb_' . $changeId]);
     }
 
     /** GET /deon-ai/hygiene-list — aktuelle robots.txt/llms.txt Inhalte (für den Editor). */
@@ -374,54 +374,90 @@ class ApiController extends Controller
     }
 
     /**
-     * GET /deon-ai/changes — Änderungsprotokoll (für Rollback-UI in Deon AI).
-     * Query: ?target_type=&limit=
+     * GET /deon-ai/rollback/list — Änderungs-Journal (Proxy-Konvention: der
+     * Deon-AI-Worker leitet den Rollback-Tab 1:1 an diese Unterpfade weiter,
+     * analog zum WordPress-/TYPO3-Plugin-Journal).
+     * Query: ?limit=
      */
-    public function actionListChanges(): Response
+    public function actionRollbackList(): Response
     {
         $this->requireDeonKey();
-        $query = (new \craft\db\Query())
+        $limit = min((int)(Craft::$app->getRequest()->getQueryParam('limit') ?: 50), 200);
+        $rows = (new \craft\db\Query())
             ->from('{{%deonai_change_log}}')
             ->orderBy(['dateCreated' => SORT_DESC])
-            ->limit(min((int)(Craft::$app->getRequest()->getQueryParam('limit') ?: 100), 500));
+            ->limit($limit)
+            ->all();
 
-        $targetType = Craft::$app->getRequest()->getQueryParam('target_type');
-        if ($targetType) {
-            $query->andWhere(['targetType' => (string)$targetType]);
+        $entries = array_map(function (array $row) {
+            return [
+                'rollback_id' => 'rb_' . $row['id'],
+                'operation_type' => $row['beforeJson'] === null ? 'creation' : 'mutation',
+                'endpoint' => self::TARGET_LABELS[$row['targetType']] ?? $row['targetType'],
+                'action' => $row['targetKey'],
+                'status' => $row['rolledBack'] ? 'restored' : 'applied',
+                'created_at' => $row['dateCreated'],
+            ];
+        }, $rows);
+
+        return $this->asJson(['ok' => true, 'entries' => $entries]);
+    }
+
+    /** GET /deon-ai/rollback/<id> — Einzelnen Journal-Eintrag abrufen. */
+    public function actionRollbackGet(string $id): Response
+    {
+        $this->requireDeonKey();
+        $log = $this->findChangeLog($id);
+        if (!$log) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+        return $this->asJson(['ok' => true] + $this->changeLogToEntry($log));
+    }
+
+    /** POST /deon-ai/rollback/<id>/preview — zeigt, was ein Rollback wiederherstellen würde. */
+    public function actionRollbackPreview(string $id): Response
+    {
+        $this->requireDeonKey();
+        $log = $this->findChangeLog($id);
+        if (!$log) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+        if ($log['rolledBack']) {
+            return $this->asJson(['ok' => false, 'error' => 'already_restored']);
         }
 
-        $rows = $query->all();
-        foreach ($rows as &$row) {
-            $row['before'] = $row['beforeJson'] !== null ? json_decode($row['beforeJson'], true) : null;
-            $row['after'] = json_decode($row['afterJson'], true);
-            unset($row['beforeJson'], $row['afterJson']);
+        [$conflict] = $this->checkConflict($log);
+        if ($conflict) {
+            return $this->asJson(['conflict' => true, 'message' => 'Diese Seite wurde nach der Deon-AI-Änderung erneut bearbeitet.']);
         }
-        unset($row);
 
-        return $this->asJson(['ok' => true, 'changes' => $rows]);
+        return $this->asJson(['will_do' => $this->describeChange($log)]);
     }
 
     /**
-     * POST /deon-ai/rollback — eine protokollierte Änderung rückgängig machen.
-     * Body: { change_id }
+     * POST /deon-ai/rollback/<id>/restore — Änderung rückgängig machen.
+     * Body: { force? } — überschreibt einen erkannten Konflikt.
      */
-    public function actionRollback(): Response
+    public function actionRollbackRestore(string $id): Response
     {
         $this->requireDeonKey();
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
+        $force = !empty($body['force']);
 
-        $changeId = (int)($body['change_id'] ?? 0);
-        if (!$changeId) {
-            return $this->asJson(['ok' => false, 'error' => 'change_id required'])->setStatusCode(400);
-        }
-
-        $log = (new \craft\db\Query())->from('{{%deonai_change_log}}')->where(['id' => $changeId])->one();
+        $log = $this->findChangeLog($id);
         if (!$log) {
-            return $this->asJson(['ok' => false, 'error' => 'change_not_found'])->setStatusCode(404);
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
         }
         if ($log['rolledBack']) {
-            return $this->asJson(['ok' => false, 'error' => 'already_rolled_back'])->setStatusCode(409);
+            return $this->asJson(['ok' => false, 'error' => 'already_restored'])->setStatusCode(409);
+        }
+
+        if (!$force) {
+            [$conflict] = $this->checkConflict($log);
+            if ($conflict) {
+                return $this->asJson(['ok' => false, 'error' => 'conflict', 'message' => 'Diese Seite wurde nach der Deon-AI-Änderung erneut bearbeitet.'])->setStatusCode(409);
+            }
         }
 
         $before = $log['beforeJson'] !== null ? json_decode($log['beforeJson'], true) : null;
@@ -431,6 +467,7 @@ class ApiController extends Controller
                 'seo_override' => $this->rollbackSeoOverride($log['targetKey'], $before),
                 'hygiene' => $this->rollbackHygiene($log['targetKey'], $before),
                 'entry' => $this->rollbackEntry($log['targetKey'], $before),
+                'restore_point' => $this->restoreSnapshot(json_decode($log['afterJson'], true) ?: []),
                 default => ['ok' => false, 'error' => 'unknown_target_type'],
             };
         } catch (\Throwable $e) {
@@ -444,9 +481,132 @@ class ApiController extends Controller
         Craft::$app->getDb()->createCommand()->update('{{%deonai_change_log}}', [
             'rolledBack' => true,
             'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
-        ], ['id' => $changeId])->execute();
+        ], ['id' => $log['id']])->execute();
 
-        return $this->asJson(array_merge(['ok' => true, 'change_id' => $changeId, 'target_type' => $log['targetType'], 'target_key' => $log['targetKey']], $result));
+        return $this->asJson(array_merge(['success' => true], $result));
+    }
+
+    /**
+     * POST /deon-ai/rollback/restore-point — kompletten Sicherungspunkt anlegen
+     * (alle aktuell verwalteten SEO-Overrides, robots.txt/llms.txt und Entries
+     * der konfigurierten Section). Erfüllt "einmal komplett gesichert, bevor
+     * sich etwas ändert" — als reines SQL-Snapshot, kein shell_exec/mysqldump.
+     * Body: { label? }
+     */
+    public function actionRollbackCreateRestorePoint(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $label = (string)($body['label'] ?? 'Sicherungspunkt');
+        $settings = Plugin::getInstance()->getSettings();
+
+        $snapshot = [
+            'seo_overrides' => (new \craft\db\Query())->from('{{%deonai_seo_overrides}}')->limit(500)->all(),
+            'hygiene' => (new \craft\db\Query())->from('{{%deonai_seo_hygiene}}')->all(),
+            'entries' => [],
+        ];
+
+        $section = Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle);
+        if ($section) {
+            $entries = Entry::find()->sectionId($section->id)->status(null)->limit(200)->all();
+            foreach ($entries as $entry) {
+                $snapshot['entries'][] = [
+                    'id' => $entry->id,
+                    'title' => $entry->title,
+                    'slug' => $entry->slug,
+                    'enabled' => $entry->enabled,
+                    'bodyFieldHandle' => $settings->blogBodyFieldHandle,
+                    'bodyValue' => $this->safeFieldString($entry, $settings->blogBodyFieldHandle),
+                ];
+            }
+        }
+
+        $changeId = $this->logChange('restore_point', $label, null, $snapshot, $label);
+
+        return $this->asJson([
+            'ok' => true,
+            'rollback_id' => 'rb_' . $changeId,
+            'seo_overrides' => count($snapshot['seo_overrides']),
+            'hygiene' => count($snapshot['hygiene']),
+            'entries' => count($snapshot['entries']),
+        ]);
+    }
+
+    /** Menschlich lesbare Labels je Ziel-Typ, für Journal-Anzeige + Preview-Text. */
+    private const TARGET_LABELS = [
+        'seo_override' => 'SEO-Override',
+        'hygiene' => 'robots.txt/llms.txt',
+        'entry' => 'Blog-Entry',
+        'restore_point' => 'Sicherungspunkt',
+    ];
+
+    private function findChangeLog(string $rawId): ?array
+    {
+        if (!preg_match('/^(?:rb_)?(\d+)$/', $rawId, $m)) {
+            return null;
+        }
+        return (new \craft\db\Query())->from('{{%deonai_change_log}}')->where(['id' => (int)$m[1]])->one() ?: null;
+    }
+
+    private function changeLogToEntry(array $log): array
+    {
+        return [
+            'rollback_id' => 'rb_' . $log['id'],
+            'operation_type' => $log['beforeJson'] === null ? 'creation' : 'mutation',
+            'endpoint' => self::TARGET_LABELS[$log['targetType']] ?? $log['targetType'],
+            'action' => $log['targetKey'],
+            'status' => $log['rolledBack'] ? 'restored' : 'applied',
+            'created_at' => $log['dateCreated'],
+        ];
+    }
+
+    private function describeChange(array $log): string
+    {
+        $label = self::TARGET_LABELS[$log['targetType']] ?? $log['targetType'];
+        if ($log['targetType'] === 'restore_point') {
+            $snapshot = json_decode($log['afterJson'], true) ?: [];
+            return sprintf(
+                'Stellt %d SEO-Override(s), %d robots.txt/llms.txt-Eintrag/Einträge und %d Entry/Entries auf den Stand von "%s" zurück.',
+                count($snapshot['seo_overrides'] ?? []),
+                count($snapshot['hygiene'] ?? []),
+                count($snapshot['entries'] ?? []),
+                $log['targetKey']
+            );
+        }
+        $verb = $log['beforeJson'] === null ? 'entfernt' : 'setzt zurück';
+        return $label . ' für "' . $log['targetKey'] . '" wird ' . $verb . '.';
+    }
+
+    /**
+     * Grober Konflikt-Check: hat sich der Live-Zustand seit dieser Deon-AI-
+     * Änderung verändert (jemand hat manuell danach editiert)? Vergleicht den
+     * damals gespeicherten Nachher-Zustand mit dem aktuellen.
+     * @return array{0: bool} [conflict]
+     */
+    private function checkConflict(array $log): array
+    {
+        $after = json_decode($log['afterJson'], true) ?: [];
+        $current = match ($log['targetType']) {
+            'seo_override' => (new \craft\db\Query())->from('{{%deonai_seo_overrides}}')->where(['uri' => $log['targetKey']])->one() ?: null,
+            'hygiene' => (new \craft\db\Query())->from('{{%deonai_seo_hygiene}}')->where(['type' => $log['targetKey']])->one() ?: null,
+            'entry' => null, // Entries ändern sich zu leicht (dateUpdated etc.) für einen sinnvollen Diff — kein Konflikt-Check.
+            default => null,
+        };
+        if ($current === null) {
+            return [false];
+        }
+        $fields = match ($log['targetType']) {
+            'seo_override' => ['title', 'metaDescription', 'canonical', 'schemaJson'],
+            'hygiene' => ['content'],
+            default => [],
+        };
+        foreach ($fields as $field) {
+            if (($current[$field] ?? null) !== ($after[$field] ?? null)) {
+                return [true];
+            }
+        }
+        return [false];
     }
 
     private function rollbackSeoOverride(string $uri, ?array $before): array
@@ -524,6 +684,65 @@ class ApiController extends Controller
             return ['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()];
         }
         return ['ok' => true, 'action' => 'restored'];
+    }
+
+    /** Spielt einen kompletten Sicherungspunkt zurück (siehe actionRollbackCreateRestorePoint). */
+    private function restoreSnapshot(array $snapshot): array
+    {
+        $db = Craft::$app->getDb();
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+
+        // Kein upsert(): deonai_seo_overrides.uri hat keinen echten Unique-Constraint
+        // (nur einen Index) — manuelles Select-dann-Insert-oder-Update wie im Rest
+        // des Controllers, statt uns auf DB-seitige ON-DUPLICATE-KEY-Semantik zu
+        // verlassen, die ohne Unique-Key nicht zuverlässig greift.
+        foreach ($snapshot['seo_overrides'] ?? [] as $row) {
+            $uri = (string)$row['uri'];
+            $existing = (new \craft\db\Query())->from('{{%deonai_seo_overrides}}')->where(['uri' => $uri])->one();
+            $columns = array_diff_key($row, ['id' => true, 'uid' => true, 'dateCreated' => true]);
+            $columns['dateUpdated'] = $now;
+            if ($existing) {
+                $db->createCommand()->update('{{%deonai_seo_overrides}}', $columns, ['id' => $existing['id']])->execute();
+            } else {
+                $columns['dateCreated'] = $now;
+                $columns['uid'] = StringHelper::UUID();
+                $db->createCommand()->insert('{{%deonai_seo_overrides}}', $columns)->execute();
+            }
+        }
+        foreach ($snapshot['hygiene'] ?? [] as $row) {
+            $type = (string)$row['type'];
+            $existing = (new \craft\db\Query())->from('{{%deonai_seo_hygiene}}')->where(['type' => $type])->one();
+            $columns = array_diff_key($row, ['id' => true, 'uid' => true, 'dateCreated' => true]);
+            $columns['dateUpdated'] = $now;
+            if ($existing) {
+                $db->createCommand()->update('{{%deonai_seo_hygiene}}', $columns, ['id' => $existing['id']])->execute();
+            } else {
+                $columns['dateCreated'] = $now;
+                $columns['uid'] = StringHelper::UUID();
+                $db->createCommand()->insert('{{%deonai_seo_hygiene}}', $columns)->execute();
+            }
+        }
+        $restoredEntries = 0;
+        foreach ($snapshot['entries'] ?? [] as $entrySnapshot) {
+            $entry = Entry::find()->id((int)$entrySnapshot['id'])->status(null)->one();
+            if (!$entry) {
+                continue; // Entry existiert nicht mehr — überspringen statt neu anzulegen (ID nicht wiederverwendbar).
+            }
+            $entry->title = (string)($entrySnapshot['title'] ?? $entry->title);
+            $entry->enabled = (bool)($entrySnapshot['enabled'] ?? $entry->enabled);
+            if (!empty($entrySnapshot['bodyFieldHandle'])) {
+                try {
+                    $entry->setFieldValue((string)$entrySnapshot['bodyFieldHandle'], $entrySnapshot['bodyValue'] ?? '');
+                } catch (\Throwable $e) {
+                    continue;
+                }
+            }
+            if (Craft::$app->getElements()->saveElement($entry)) {
+                $restoredEntries++;
+            }
+        }
+
+        return ['ok' => true, 'action' => 'restored', 'entries_restored' => $restoredEntries];
     }
 
     /** Protokolliert eine Änderung (Vorher-/Nachher-Zustand) fürs Rollback. Gibt die change_id zurück. */

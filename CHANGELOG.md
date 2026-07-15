@@ -4,9 +4,10 @@
 
 ### Added
 - Änderungsprotokoll mit Rollback: jede Deon-AI-Änderung (SEO-Override, Entry, robots.txt/llms.txt) speichert automatisch den Vorher-Zustand — kein separater Backup-Schritt, funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig)
-- `/deon-ai/changes` — Änderungsprotokoll auflisten (`?target_type=&limit=`)
-- `/deon-ai/rollback` — eine Änderung per `change_id` rückgängig machen; neu angelegte Entries wandern dabei in den Craft-Papierkorb (weiches Löschen, nicht endgültig)
-- Alle schreibenden Endpoints (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) akzeptieren optional `note` und geben `change_id` in der Antwort zurück
+- `/deon-ai/rollback/list`, `/rollback/<rb_id>`, `/rollback/<rb_id>/preview`, `/rollback/<rb_id>/restore` — folgt derselben Proxy-Konvention wie das WordPress-/TYPO3-Plugin, erscheint damit im bestehenden "Änderungs-Journal"-Tab des Dashboards statt eines eigenen, unverbundenen Endpoints
+- `/deon-ai/rollback/restore-point` — kompletter Sicherungspunkt (Snapshot aller SEO-Overrides, robots.txt/llms.txt, Entries) als reines SQL-Snapshot
+- Konflikt-Erkennung: `restore` bricht ab (HTTP 409), wenn der Live-Zustand seit der Deon-AI-Änderung manuell verändert wurde — überschreibbar mit `force: true`
+- Alle schreibenden Endpoints (`/deon-ai/seo`, `/deon-ai/entry`, `/deon-ai/hygiene`) akzeptieren optional `note` und geben `rollback_id` in der Antwort zurück
 
 ## 0.2.0 - 2026-07-14
 

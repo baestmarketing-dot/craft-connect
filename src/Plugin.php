@@ -52,8 +52,14 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/asset'] = 'deon-ai-connect/api/upload-asset';
                 $event->rules['deon-ai/hygiene'] = 'deon-ai-connect/api/set-hygiene';
                 $event->rules['deon-ai/hygiene-list'] = 'deon-ai-connect/api/hygiene-list';
-                $event->rules['deon-ai/changes'] = 'deon-ai-connect/api/list-changes';
-                $event->rules['deon-ai/rollback'] = 'deon-ai-connect/api/rollback';
+                // Rollback-Journal: Proxy-Konvention des Deon-AI-Workers (analog zum
+                // WordPress-/TYPO3-Plugin) — feste Unterpfade vor dem <id>-Catch-all,
+                // sonst würde z. B. "list" fälschlich als <id> interpretiert.
+                $event->rules['deon-ai/rollback/list'] = 'deon-ai-connect/api/rollback-list';
+                $event->rules['deon-ai/rollback/restore-point'] = 'deon-ai-connect/api/rollback-create-restore-point';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>/preview'] = 'deon-ai-connect/api/rollback-preview';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>/restore'] = 'deon-ai-connect/api/rollback-restore';
+                $event->rules['deon-ai/rollback/<id:[^\/]+>'] = 'deon-ai-connect/api/rollback-get';
 
                 // robots.txt/llms.txt nur ausliefern, wenn explizit aktiviert — sonst
                 // würde eine leere Tabelle jede physische robots.txt-Route verdecken.
