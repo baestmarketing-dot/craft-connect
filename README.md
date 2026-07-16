@@ -11,6 +11,7 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **Rollback-fähiges Änderungsprotokoll** — jede Deon-AI-Änderung speichert automatisch ihren Vorher-Zustand, bevor sie geschrieben wird. Kein separater Backup-Job, der ausfallen könnte: die Sicherung ist untrennbarer Teil derselben Datenbank-Transaktion wie die Änderung selbst und funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig).
 - **Native Content-Bausteine** — FAQ-Blöcke idempotent in bestehende Entries einbauen (`/deon-ai/faq`), Standort-/Faktenseiten als eigene Section anlegen (`/deon-ai/page`, Setting `pagesSectionHandle`), robots.txt/llms.txt direkt im Webroot lesen/schreiben (`/deon-ai/files`) — jeweils mit Backup vor dem Überschreiben.
 - **Berechtigungen** — der Kunde entscheidet im Control Panel selbst, was Deon AI ändern darf. Nicht freigegebene 1-Klick-Fixes werden im Deon-AI-Dashboard ausgegraut statt einen Fehler zu werfen.
+- **Remote-Self-Update** — Deon AI kann das Plugin bei neuen Versionen selbstständig per Composer aktualisieren, ohne dass jemand ins Control Panel muss. Craft spielt Plugin-Updates sonst nie automatisch ein.
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -52,8 +53,26 @@ Unter **Einstellungen → Plugins → Deon AI Connect → Berechtigungen** legt 
 | Neue Seiten anlegen (`allowPageCreate`) | aus | `/deon-ai/entry`, `/deon-ai/page` |
 | robots.txt / llms.txt (`allowFiles`) | aus | `/deon-ai/files`, `/deon-ai/hygiene` |
 | Bild-Uploads (`allowAssets`) | aus | `/deon-ai/asset` |
+| Plugin automatisch aktualisieren (`allowSelfUpdate`) | an | `/deon-ai/self-update` |
 
-Nur SEO-Overrides sind standardmäßig aktiv, da sie rein serverseitig wirken und keinen Inhalt verändern. Ein Aufruf gegen einen nicht freigegebenen Endpoint liefert `403 { "ok": false, "error": "consent_required", "permission": "<key>" }`. `/deon-ai/ping` gibt den aktuellen Freigabe-Stand aller Kategorien im Feld `permissions` zurück, damit Deon AI nicht freigegebene 1-Klick-Fixes im Dashboard ausgrauen kann. Lese-Endpoints (`ping`, `seo-list`, `entries`, `hygiene-list`, `rollback/*`) sind bewusst nicht gegated — Rückgängig machen (Rollback) funktioniert unabhängig von diesen Schaltern immer.
+Nur SEO-Overrides und Self-Update sind standardmäßig aktiv — SEO-Overrides, da sie rein serverseitig wirken und keinen Inhalt verändern; Self-Update, da Updates auch Sicherheitsfixes enthalten können. Ein Aufruf gegen einen nicht freigegebenen Endpoint liefert `403 { "ok": false, "error": "consent_required", "permission": "<key>" }`. `/deon-ai/ping` gibt den aktuellen Freigabe-Stand aller Kategorien im Feld `permissions` zurück, damit Deon AI nicht freigegebene 1-Klick-Fixes im Dashboard ausgrauen kann. Lese-Endpoints (`ping`, `seo-list`, `entries`, `hygiene-list`, `rollback/*`) sind bewusst nicht gegated — Rückgängig machen (Rollback) funktioniert unabhängig von diesen Schaltern immer.
+
+## Remote-Self-Update
+
+Craft spielt Plugin-Updates nie automatisch ein — jemand muss im Control Panel klicken. Deon AI kann das stattdessen selbst anstoßen:
+
+1. **`POST /deon-ai/self-update`** (`{ "version": "0.6.1" }`) — hebt **ausschließlich** `deon-ai/craft-connect` per Composer auf die angegebene Zielversion an (nie `craft update all` oder andere Pakete). Ziel bereits installiert → `{ ok: true, already: true }`. Ein Preflight-Check prüft vorher, ob der Server das technisch kann (`proc_open` verfügbar, `memory_limit` ≥ 256M, `composer.phar` vorhanden) — schlägt er fehl, bleibt die Installation unangetastet und die Antwort ist `422 { ok: false, error: "self_update_unavailable", reason: "…" }`. Vor dem Swap wird fail-soft ein DB-Backup versucht (`Craft::$app->getDb()->backup()`, braucht `mysqldump`/`pg_dump`). Antwort bei Erfolg: `{ ok: true, from: "0.4.0", to: "0.6.1", needs_migration: true }`.
+2. **`POST /deon-ai/up`** — führt danach, in einem **neuen** Request, die Plugin-Migrationen der frisch installierten Version aus. Zwei getrennte Requests sind nötig, weil direkt nach dem Composer-Swap im selben PHP-Prozess noch der alte Klassen-Code geladen ist. Antwort: `{ ok: true, migrated: true, version: "0.6.1" }`.
+
+`/deon-ai/ping` meldet zusätzlich ein Fähigkeits-Flag `self_update` (kann dieser Server technisch selbst updaten, unabhängig vom `allowSelfUpdate`-Schalter) sowie `plugin_version`/`craft_version`/`php_version` und `sections_ok` (ob die konfigurierten Section-Handles für Blog und Seiten tatsächlich existieren).
+
+Funktioniert Composer im Web-Request nicht (manches Shared-Hosting sperrt `proc_open` oder begrenzt `memory_limit`/`max_execution_time` zu knapp), bleibt als Fallback die Konsole — z. B. per Cron:
+
+```bash
+php craft deon-ai-connect/update 0.6.1
+```
+
+Gleicher Code-Pfad wie die REST-Endpoints (Composer-Swap + Migrationen in einem Lauf), nur ohne die Web-Request-Limits.
 
 ## Änderungsprotokoll & Rollback
 

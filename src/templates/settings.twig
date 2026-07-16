@@ -51,6 +51,12 @@
     id: 'allowAssets', name: 'allowAssets', on: settings.allowAssets,
 }) }}
 
+{{ forms.lightswitchField({
+    label: 'Plugin automatisch aktualisieren'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, dieses Plugin bei neuen Versionen selbstständig per Composer zu aktualisieren (/deon-ai/self-update) — kein manueller Login ins Control Panel nötig. Standardmäßig aktiv, da Updates auch Sicherheitsfixes enthalten können. Schlägt ein Update auf dem Server fehl (z. B. weil Composer im Hosting nicht ausführbar ist), bleibt die installierte Version unverändert und Deon AI zeigt stattdessen eine Anleitung zum manuellen Update im Control Panel.'|t('deon-ai-connect'),
+    id: 'allowSelfUpdate', name: 'allowSelfUpdate', on: settings.allowSelfUpdate,
+}) }}
+
 <hr>
 
 {{ forms.lightswitchField({

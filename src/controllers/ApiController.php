@@ -39,6 +39,7 @@ class ApiController extends Controller
         'page_create' => 'allowPageCreate',
         'files' => 'allowFiles',
         'assets' => 'allowAssets',
+        'self_update' => 'allowSelfUpdate',
     ];
 
     /** Prüft eine Berechtigung; gibt bei fehlender Freigabe die fertige 403-Response zurück, sonst null. */
@@ -57,20 +58,137 @@ class ApiController extends Controller
     {
         $this->requireDeonKey();
         $settings = Plugin::getInstance()->getSettings();
+        $version = Plugin::getInstance()->getVersion();
+        [$selfUpdateCapable] = $this->selfUpdatePreflight();
+
         return $this->asJson([
             'ok' => true,
             'plugin' => 'deon-ai-connect',
-            'version' => Plugin::getInstance()->getVersion(),
+            'version' => $version,
             'craft' => Craft::$app->getVersion(),
             'php' => PHP_VERSION,
+            // Duplikate der obigen Felder unter den vom Worker erwarteten Namen (Self-Update-Erkennung).
+            'plugin_version' => $version,
+            'craft_version' => Craft::$app->getVersion(),
+            'php_version' => PHP_VERSION,
+            // Fähigkeits-Flag: kann dieser Server technisch überhaupt selbst updaten
+            // (proc_open, Speicher, composer.phar) — unabhängig von der Freigabe
+            // durch die Kundin, die unter permissions.self_update steht.
+            'self_update' => $selfUpdateCapable,
+            'sections_ok' => [
+                'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
+                'pages' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->pagesSectionHandle ?: $settings->blogSectionHandle),
+            ],
             'permissions' => [
                 'seo_meta' => (bool)$settings->allowSeoMeta,
                 'content_edit' => (bool)$settings->allowContentEdit,
                 'page_create' => (bool)$settings->allowPageCreate,
                 'files' => (bool)$settings->allowFiles,
                 'assets' => (bool)$settings->allowAssets,
+                'self_update' => (bool)$settings->allowSelfUpdate,
             ],
         ]);
+    }
+
+    /**
+     * POST /deon-ai/self-update — Plugin per Composer auf eine konkrete Zielversion
+     * anheben (Phase A: Composer-Swap). Body: { version: "0.6.1" }
+     * Führt bewusst KEINE Migrationen im selben Request aus — der alte Klassen-
+     * Code ist nach dem Composer-Swap noch geladen. Der Worker ruft danach
+     * POST /deon-ai/up in einem NEUEN Request auf (siehe dort).
+     */
+    public function actionSelfUpdate(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('self_update')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $target = trim((string)($body['version'] ?? ''));
+        if (!preg_match('/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/', $target)) {
+            return $this->asJson(['ok' => false, 'error' => 'version required (semver, e.g. "0.6.1")'])->setStatusCode(400);
+        }
+
+        $current = Plugin::getInstance()->getVersion();
+        if ($target === $current) {
+            return $this->asJson(['ok' => true, 'already' => true, 'version' => $current]);
+        }
+
+        [$capable, $reason] = $this->selfUpdatePreflight();
+        if (!$capable) {
+            return $this->asJson(['ok' => false, 'error' => 'self_update_unavailable', 'reason' => $reason])->setStatusCode(422);
+        }
+
+        \craft\helpers\App::maxPowerCaptain();
+
+        try {
+            Craft::$app->getDb()->backup();
+        } catch (\Throwable $e) {
+            // Fail-soft: DB-Dump braucht mysqldump/pg_dump per shell_exec, das ist auf
+            // manchem Shared-Hosting gesperrt — darf das eigentliche Update nie blockieren.
+            Craft::warning('deon-ai-connect self-update: DB-Backup fehlgeschlagen: ' . $e->getMessage(), __METHOD__);
+        }
+
+        try {
+            // Nur das eigene Paket anfassen — niemals "craft update all" o. Ä.
+            // Nur EIN Argument übergeben: Composer::install()'s zweiter Parameter ist in
+            // Craft 5 ein callable, in Craft 4 ein Composer\IO\IOInterface — inkompatible
+            // Signaturen. Ohne zweites Argument funktioniert der Aufruf auf beiden.
+            Craft::$app->getComposer()->install(['deon-ai/craft-connect' => '==' . $target]);
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'self_update_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+
+        return $this->asJson(['ok' => true, 'from' => $current, 'to' => $target, 'needs_migration' => true]);
+    }
+
+    /**
+     * POST /deon-ai/up — Phase B: Plugin-Migrationen nach einem Composer-Swap
+     * ausführen (neuer Request, damit der neue Code bereits geladen ist).
+     * Bewusst NICHT über checkPermission('self_update') gegated: an dieser
+     * Stelle liegt der neue Code bereits auf der Platte, ein verweigertes
+     * Migrieren würde die Seite mit neuem Code + altem DB-Schema zurücklassen.
+     */
+    public function actionUp(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+
+        try {
+            Craft::$app->getUpdates()->runMigrations(['deon-ai-connect']);
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'migration_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+
+        return $this->asJson(['ok' => true, 'migrated' => true, 'version' => Plugin::getInstance()->getVersion()]);
+    }
+
+    /**
+     * Fähigkeits-Check fürs Self-Update: kann dieser Server technisch Composer
+     * als Subprozess starten? (Craft nutzt intern Symfony Process/proc_open,
+     * siehe craft\services\Composer::runComposerCommand().)
+     * @return array{0: bool, 1: ?string} [capable, reason]
+     */
+    private function selfUpdatePreflight(): array
+    {
+        if (!function_exists('proc_open')) {
+            return [false, 'proc_open ist nicht verfügbar.'];
+        }
+        $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+        if (in_array('proc_open', $disabled, true)) {
+            return [false, 'proc_open ist über disable_functions gesperrt (typisch bei restriktivem Shared-Hosting).'];
+        }
+        $memoryLimit = \craft\helpers\App::phpConfigValueInBytes('memory_limit');
+        if ($memoryLimit !== -1 && $memoryLimit < 256 * 1024 * 1024) {
+            return [false, 'memory_limit ist kleiner als 256M.'];
+        }
+        $pharPath = Craft::getAlias('@lib/composer.phar');
+        if (!is_file($pharPath)) {
+            return [false, 'composer.phar wurde in dieser Craft-Installation nicht gefunden.'];
+        }
+        return [true, null];
     }
 
     /**

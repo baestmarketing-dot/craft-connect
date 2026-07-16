@@ -47,6 +47,12 @@ class Plugin extends BasePlugin
     {
         parent::init();
 
+        // Console-Fallback für Self-Update (`php craft deon-ai-connect/update <version>`),
+        // falls Composer im Web-Request an exec/memory-Limits scheitert.
+        if (Craft::$app->getRequest()->getIsConsoleRequest()) {
+            $this->controllerNamespace = 'deonai\\craftconnect\\console\\controllers';
+        }
+
         // Ein-Key-Onboarding: Nutzer trägt nur den Connection-Key ein, der Rest
         // (Site-ID, SDK-Key, Verifizierungs-UUID) wird beim Speichern automatisch
         // von Deon AI abgeholt (Bootstrap) — analog zum WordPress-Plugin-Flow.
@@ -66,6 +72,8 @@ class Plugin extends BasePlugin
             UrlManager::EVENT_REGISTER_SITE_URL_RULES,
             function (RegisterUrlRulesEvent $event) {
                 $event->rules['deon-ai/ping'] = 'deon-ai-connect/api/ping';
+                $event->rules['deon-ai/self-update'] = 'deon-ai-connect/api/self-update';
+                $event->rules['deon-ai/up'] = 'deon-ai-connect/api/up';
                 $event->rules['deon-ai/seo'] = 'deon-ai-connect/api/set-seo';
                 $event->rules['deon-ai/seo-list'] = 'deon-ai-connect/api/list-seo';
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
