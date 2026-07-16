@@ -32,16 +32,44 @@ class ApiController extends Controller
         }
     }
 
+    /** Ordnet die kurzen Berechtigungs-Keys (siehe /deon-ai/ping) den Settings-Properties zu. */
+    private const PERMISSION_PROPERTIES = [
+        'seo_meta' => 'allowSeoMeta',
+        'content_edit' => 'allowContentEdit',
+        'page_create' => 'allowPageCreate',
+        'files' => 'allowFiles',
+        'assets' => 'allowAssets',
+    ];
+
+    /** Prüft eine Berechtigung; gibt bei fehlender Freigabe die fertige 403-Response zurück, sonst null. */
+    private function checkPermission(string $key): ?Response
+    {
+        $property = self::PERMISSION_PROPERTIES[$key] ?? null;
+        $settings = Plugin::getInstance()->getSettings();
+        if ($property !== null && !empty($settings->$property)) {
+            return null;
+        }
+        return $this->asJson(['ok' => false, 'error' => 'consent_required', 'permission' => $key])->setStatusCode(403);
+    }
+
     /** GET /deon-ai/ping — Health + Versionen (für "Verbindung prüfen"). */
     public function actionPing(): Response
     {
         $this->requireDeonKey();
+        $settings = Plugin::getInstance()->getSettings();
         return $this->asJson([
             'ok' => true,
             'plugin' => 'deon-ai-connect',
             'version' => Plugin::getInstance()->getVersion(),
             'craft' => Craft::$app->getVersion(),
             'php' => PHP_VERSION,
+            'permissions' => [
+                'seo_meta' => (bool)$settings->allowSeoMeta,
+                'content_edit' => (bool)$settings->allowContentEdit,
+                'page_create' => (bool)$settings->allowPageCreate,
+                'files' => (bool)$settings->allowFiles,
+                'assets' => (bool)$settings->allowAssets,
+            ],
         ]);
     }
 
@@ -52,6 +80,9 @@ class ApiController extends Controller
     public function actionSetSeo(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('seo_meta')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
 
@@ -126,6 +157,9 @@ class ApiController extends Controller
     public function actionUpsertEntry(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('page_create')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
         $settings = Plugin::getInstance()->getSettings();
@@ -283,6 +317,9 @@ class ApiController extends Controller
     public function actionUploadAsset(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('assets')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $settings = Plugin::getInstance()->getSettings();
         $body = Craft::$app->getRequest()->getBodyParams();
@@ -330,6 +367,9 @@ class ApiController extends Controller
     public function actionFiles(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('files')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
 
@@ -371,6 +411,9 @@ class ApiController extends Controller
     public function actionFaq(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
         $settings = Plugin::getInstance()->getSettings();
@@ -437,6 +480,9 @@ class ApiController extends Controller
     public function actionPage(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('page_create')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
         $settings = Plugin::getInstance()->getSettings();
@@ -526,6 +572,9 @@ class ApiController extends Controller
     public function actionSetHygiene(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('files')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
 

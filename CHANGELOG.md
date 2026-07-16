@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 - 2026-07-16
+
+### Added
+- Berechtigungen: 5 neue Schalter im Control Panel („Berechtigungen — was darf Deon AI ändern?"), mit denen der Kunde selbst entscheidet, was Deon AI ändern darf — `allowSeoMeta` (Standard an), `allowContentEdit`, `allowPageCreate`, `allowFiles`, `allowAssets` (Standard jeweils aus)
+- Schreibende Endpoints prüfen jetzt die passende Berechtigung und liefern `403 { ok: false, error: "consent_required", permission: "…" }`, solange sie nicht freigegeben ist: `/deon-ai/seo` → `seo_meta`, `/deon-ai/faq` → `content_edit`, `/deon-ai/entry` + `/deon-ai/page` → `page_create`, `/deon-ai/files` + `/deon-ai/hygiene` → `files`, `/deon-ai/asset` → `assets`. Lese-Endpoints (`ping`, `seo-list`, `entries`, `hygiene-list`, `rollback/*`) bleiben ungegated — Rückgängig machen funktioniert immer.
+- `/deon-ai/ping` liefert jetzt ein `permissions`-Objekt mit dem aktuellen Freigabe-Stand aller fünf Kategorien, damit Deon AI nicht freigegebene 1-Klick-Fixes im Dashboard ausgrauen kann.
+
 ## 0.5.0 - 2026-07-16
 
 ### Added

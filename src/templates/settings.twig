@@ -16,6 +16,43 @@
     </div>
 {% endif %}
 
+<hr>
+
+<h2>{{ 'Berechtigungen — was darf Deon AI ändern?'|t('deon-ai-connect') }}</h2>
+<p class="light">{{ 'Deon AI zeigt 1-Klick-Fixes im Dashboard nur an, wenn die passende Berechtigung hier aktiv ist — nicht freigegebene Fixes werden dort ausgegraut. Rückgängig machen (Rollback) funktioniert unabhängig davon immer.'|t('deon-ai-connect') }}</p>
+
+{{ forms.lightswitchField({
+    label: 'Title/Meta-Description/Canonical/Schema setzen'|t('deon-ai-connect'),
+    instructions: 'SEO-Overrides über /deon-ai/seo — Standardmäßig aktiv, da rein serverseitig und ohne Inhaltsänderung.'|t('deon-ai-connect'),
+    id: 'allowSeoMeta', name: 'allowSeoMeta', on: settings.allowSeoMeta,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Inhalte bestehender Seiten bearbeiten'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, den Body bestehender Entries zu ändern, z. B. FAQ-Blöcke einzubauen (/deon-ai/faq).'|t('deon-ai-connect'),
+    id: 'allowContentEdit', name: 'allowContentEdit', on: settings.allowContentEdit,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Neue Seiten anlegen'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, neue Entries anzulegen — Blog-Artikel sowie Standort-/Leistungs-/Faktenseiten (/deon-ai/entry, /deon-ai/page).'|t('deon-ai-connect'),
+    id: 'allowPageCreate', name: 'allowPageCreate', on: settings.allowPageCreate,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'robots.txt / llms.txt'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, robots.txt und llms.txt zu lesen und zu schreiben (/deon-ai/files sowie die Verwaltung weiter unten).'|t('deon-ai-connect'),
+    id: 'allowFiles', name: 'allowFiles', on: settings.allowFiles,
+}) }}
+
+{{ forms.lightswitchField({
+    label: 'Bild-Uploads'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, Bilder als Assets hochzuladen, z. B. für Featured Images (/deon-ai/asset).'|t('deon-ai-connect'),
+    id: 'allowAssets', name: 'allowAssets', on: settings.allowAssets,
+}) }}
+
+<hr>
+
 {{ forms.lightswitchField({
     label: 'Deon SDK automatisch einbinden'|t('deon-ai-connect'),
     instructions: 'Injiziert das Tracking-/A-B-Script auf allen Frontend-Seiten.'|t('deon-ai-connect'),
