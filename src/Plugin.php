@@ -28,7 +28,7 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.2.0';
+    public string $schemaVersion = '1.3.0';
     public bool $hasCpSettings = true;
 
     private const BOOTSTRAP_URL = 'https://audit.deon-ai.de/api/plugin/craft/bootstrap';
@@ -71,6 +71,9 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
                 $event->rules['deon-ai/entries'] = 'deon-ai-connect/api/list-entries';
                 $event->rules['deon-ai/asset'] = 'deon-ai-connect/api/upload-asset';
+                $event->rules['deon-ai/files'] = 'deon-ai-connect/api/files';
+                $event->rules['deon-ai/faq'] = 'deon-ai-connect/api/faq';
+                $event->rules['deon-ai/page'] = 'deon-ai-connect/api/page';
                 $event->rules['deon-ai/hygiene'] = 'deon-ai-connect/api/set-hygiene';
                 $event->rules['deon-ai/hygiene-list'] = 'deon-ai-connect/api/hygiene-list';
                 // Rollback-Journal: Proxy-Konvention des Deon-AI-Workers (analog zum

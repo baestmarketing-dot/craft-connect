@@ -31,6 +31,13 @@ class Settings extends Model
     /** Feld-Handle für den Artikel-Body (Rich-Text/CKEditor-Feld). */
     public string $blogBodyFieldHandle = 'body';
 
+    /**
+     * Section-Handle für native Seiten (Standortseiten, KI-Faktenseiten) via
+     * /deon-ai/page. Fallback-Kette dort: Request-Param > dieses Setting >
+     * blogSectionHandle.
+     */
+    public string $pagesSectionHandle = 'pages';
+
     /** Volume-Handle für Bild-Uploads (Featured Images aus Deon AI). Leer = deaktiviert. */
     public string $assetVolumeHandle = '';
 
@@ -43,7 +50,7 @@ class Settings extends Model
     public function defineRules(): array
     {
         return [
-            [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
+            [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'pagesSectionHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
             [['injectSdk', 'manageRobotsLlms'], 'boolean'],
         ];
     }

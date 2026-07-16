@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-07-16
+
+### Added
+- `/deon-ai/files` — robots.txt/llms.txt direkt im Webroot lesen/schreiben (strikte Dateinamen-Whitelist, Backup vor jedem Schreiben)
+- `/deon-ai/faq` — FAQ-Block sichtbar in den Entry-Body einbauen, idempotent über einen `data-deon-faq`-Marker (ersetzt statt zu duplizieren)
+- `/deon-ai/page` — native Seiten anlegen (Standortseiten, KI-Faktenseite), eigene Section-Auflösung über neues Setting `pagesSectionHandle`, geht standardmäßig als Entwurf raus
+- Neue Tabelle `deonai_content_backups` — Vorher-Inhalt wird vor jeder `/files`- oder `/faq`-Änderung fail-soft gesichert
+
+### Fixed
+- **Install.php enthielt nur die ursprüngliche `deonai_seo_overrides`-Tabelle.** Da Craft bei einer Neuinstallation ausschließlich `Install.php` ausführt und alle zu dem Zeitpunkt bereits vorhandenen nummerierten Migrationen ungeprüft als "erledigt" markiert (ohne sie laufen zu lassen), fehlten frischen Installationen bisher `deonai_seo_hygiene` und `deonai_change_log` komplett. `Install.php` enthält jetzt den vollständigen Tabellenstand.
+
 ## 0.4.2 - 2026-07-15
 
 ### Changed

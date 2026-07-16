@@ -320,6 +320,205 @@ class ApiController extends Controller
         return $this->asJson(['ok' => true, 'asset_id' => $assetId, 'url' => $asset?->getUrl()]);
     }
 
+    /** Physische Dateien, auf die /deon-ai/files zugreifen darf — strikte Whitelist. */
+    private const ALLOWED_FILES = ['llms.txt', 'robots.txt'];
+
+    /**
+     * POST /deon-ai/files — robots.txt/llms.txt direkt im Webroot lesen/schreiben.
+     * Body: { op: "read"|"write", filename: "llms.txt"|"robots.txt", content? }
+     */
+    public function actionFiles(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $filename = (string)($body['filename'] ?? '');
+        if (!in_array($filename, self::ALLOWED_FILES, true)) {
+            return $this->asJson(['ok' => false, 'error' => 'filename must be one of: ' . implode(', ', self::ALLOWED_FILES)])->setStatusCode(400);
+        }
+        $path = rtrim(Craft::getAlias('@webroot'), '/') . '/' . $filename;
+        $op = (string)($body['op'] ?? '');
+
+        if ($op === 'read') {
+            $exists = is_file($path);
+            $content = $exists ? (string)file_get_contents($path) : '';
+            return $this->asJson(['ok' => true, 'exists' => $exists, 'filename' => $filename, 'content' => $content]);
+        }
+
+        if ($op === 'write') {
+            $content = (string)($body['content'] ?? '');
+            if (is_file($path)) {
+                $this->backupContent('file:' . $filename, (string)file_get_contents($path));
+            }
+            try {
+                FileHelper::writeToFile($path, $content);
+            } catch (\Throwable $e) {
+                return $this->asJson(['ok' => false, 'error' => 'write_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+            }
+            return $this->asJson(['ok' => true, 'filename' => $filename, 'bytes' => strlen($content)]);
+        }
+
+        return $this->asJson(['ok' => false, 'error' => 'op must be "read" or "write"'])->setStatusCode(400);
+    }
+
+    /**
+     * POST /deon-ai/faq — FAQ-Block sichtbar in den Entry-Body einbauen.
+     * Body: { uri, faq_html, body_field? }
+     * Idempotent: enthält der Body bereits einen Block mit data-deon-faq,
+     * wird dieser ersetzt statt einen zweiten anzuhängen.
+     */
+    public function actionFaq(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $settings = Plugin::getInstance()->getSettings();
+
+        $rawUri = trim((string)($body['uri'] ?? ''), '/');
+        $uri = $rawUri === '' ? '__home__' : $rawUri;
+        $faqHtml = (string)($body['faq_html'] ?? '');
+        if ($faqHtml === '') {
+            return $this->asJson(['ok' => false, 'error' => 'faq_html required'])->setStatusCode(400);
+        }
+        $bodyFieldHandle = !empty($body['body_field']) ? (string)$body['body_field'] : $settings->blogBodyFieldHandle;
+
+        $entry = Entry::find()->uri($uri)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'entry_not_found'])->setStatusCode(404);
+        }
+
+        try {
+            $currentBody = (string)$entry->getFieldValue($bodyFieldHandle);
+        } catch (\Throwable $e) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'body_field_not_found',
+                'hint' => 'Feld-Handle "' . $bodyFieldHandle . '" existiert im Entry-Type nicht — im Plugin-Setting anpassen oder "body_field" im Request mitgeben.',
+            ])->setStatusCode(422);
+        }
+
+        $this->backupContent('entry:' . $entry->id . ':' . $bodyFieldHandle, $currentBody);
+
+        $faqBlockPattern = '~<section\b[^>]*\bdata-deon-faq\b[^>]*>.*?</section>~is';
+        $replacedExisting = (bool)preg_match($faqBlockPattern, $currentBody);
+        $newBody = $replacedExisting
+            ? preg_replace($faqBlockPattern, $faqHtml, $currentBody, 1)
+            : $currentBody . $faqHtml;
+
+        try {
+            $entry->setFieldValue($bodyFieldHandle, $newBody);
+        } catch (\Throwable $e) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'body_field_not_found',
+                'hint' => 'Feld-Handle "' . $bodyFieldHandle . '" existiert im Entry-Type nicht.',
+            ])->setStatusCode(422);
+        }
+
+        if (!Craft::$app->getElements()->saveElement($entry)) {
+            return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+        }
+
+        return $this->asJson([
+            'ok' => true,
+            'entry_id' => $entry->id,
+            'url' => $entry->getUrl(),
+            'replaced_existing' => $replacedExisting,
+        ]);
+    }
+
+    /**
+     * POST /deon-ai/page — native Seite anlegen/aktualisieren (Standortseiten,
+     * KI-Faktenseite). Body: { title, slug?, body_html, status?, section?, entry_id? }
+     * Section-Auflösung: section-Param > Setting pagesSectionHandle > blogSectionHandle.
+     * Default-Status "disabled" (Entwurf) — geht nie ungefragt live.
+     */
+    public function actionPage(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $settings = Plugin::getInstance()->getSettings();
+
+        $title = trim((string)($body['title'] ?? ''));
+        $html = (string)($body['body_html'] ?? '');
+        if ($title === '' || $html === '') {
+            return $this->asJson(['ok' => false, 'error' => 'title + body_html required'])->setStatusCode(400);
+        }
+
+        $sectionHandle = !empty($body['section'])
+            ? (string)$body['section']
+            : (!empty($settings->pagesSectionHandle) ? $settings->pagesSectionHandle : $settings->blogSectionHandle);
+
+        $section = Craft::$app->getEntries()->getSectionByHandle($sectionHandle);
+        if (!$section) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'section_not_found',
+                'hint' => 'Section-Handle "' . $sectionHandle . '" existiert nicht — "pagesSectionHandle" in den Plugin-Settings oder "section" im Request anpassen.',
+            ])->setStatusCode(422);
+        }
+
+        $entry = null;
+        if (!empty($body['entry_id'])) {
+            $entry = Entry::find()->id((int)$body['entry_id'])->status(null)->one();
+        }
+        if (!$entry) {
+            $entry = new Entry();
+            $entry->sectionId = $section->id;
+            $entryTypes = $section->getEntryTypes();
+            $entry->typeId = $entryTypes[0]->id;
+        }
+
+        $entry->title = mb_substr($title, 0, 255);
+        if (!empty($body['slug'])) {
+            $entry->slug = mb_substr((string)$body['slug'], 0, 200);
+        }
+        $entry->enabled = (($body['status'] ?? 'disabled') === 'live');
+
+        try {
+            $entry->setFieldValue($settings->blogBodyFieldHandle, $html);
+        } catch (\Throwable $e) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'body_field_not_found',
+                'hint' => 'Feld-Handle "' . $settings->blogBodyFieldHandle . '" existiert im Entry-Type nicht.',
+            ])->setStatusCode(422);
+        }
+
+        if (!Craft::$app->getElements()->saveElement($entry)) {
+            return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+        }
+
+        return $this->asJson([
+            'ok' => true,
+            'entry_id' => $entry->id,
+            'url' => $entry->getUrl(),
+            'uri' => $entry->uri,
+            'section' => $sectionHandle,
+            'status' => $entry->enabled ? 'live' : 'disabled',
+        ]);
+    }
+
+    /** Sichert Inhalt fail-soft vor einer destruktiven /files- oder /faq-Änderung. */
+    private function backupContent(string $ref, string $content): void
+    {
+        try {
+            $now = (new \DateTime())->format('Y-m-d H:i:s');
+            Craft::$app->getDb()->createCommand()->insert('{{%deonai_content_backups}}', [
+                'ref' => mb_substr($ref, 0, 255),
+                'content' => $content,
+                'dateCreated' => $now,
+                'dateUpdated' => $now,
+                'uid' => StringHelper::UUID(),
+            ])->execute();
+        } catch (\Throwable $e) {
+            // Fail-soft: ein Backup-Fehler darf den eigentlichen Fix nie blockieren.
+            Craft::warning('deon-ai-connect backup failed: ' . $e->getMessage(), __METHOD__);
+        }
+    }
+
     /**
      * POST /deon-ai/hygiene — robots.txt/llms.txt Inhalt setzen.
      * Body: { type ("robots"|"llms"), content }

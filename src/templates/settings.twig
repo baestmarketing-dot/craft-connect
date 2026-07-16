@@ -37,6 +37,12 @@
 }) }}
 
 {{ forms.textField({
+    label: 'Seiten-Section (Handle)'|t('deon-ai-connect'),
+    instructions: 'Section für native Seiten (Standortseiten, KI-Faktenseite), die Deon AI über /deon-ai/page anlegt. Fällt auf die Blog-Section zurück, falls hier nichts eingetragen ist.'|t('deon-ai-connect'),
+    id: 'pagesSectionHandle', name: 'pagesSectionHandle', value: settings.pagesSectionHandle,
+}) }}
+
+{{ forms.textField({
     label: 'Asset-Volume (Handle)'|t('deon-ai-connect'),
     instructions: 'Volume für Bild-Uploads (Featured Images). Leer lassen, um Bild-Uploads zu deaktivieren.'|t('deon-ai-connect'),
     id: 'assetVolumeHandle', name: 'assetVolumeHandle', value: settings.assetVolumeHandle,
