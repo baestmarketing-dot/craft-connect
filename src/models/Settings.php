@@ -47,11 +47,31 @@ class Settings extends Model
     /** robots.txt + llms.txt am Origin ausliefern (Deon AI verwaltet den Inhalt). */
     public bool $manageRobotsLlms = false;
 
+    // ─── Berechtigungen — was darf Deon AI ändern? ────────────────────────
+    // Gaten die schreibenden Endpoints (siehe ApiController::checkPermission()).
+    // Lese-Endpoints (ping, seo-list, entries, hygiene-list, rollback/*) sind
+    // davon bewusst ausgenommen.
+
+    /** Title/Meta-Description/Canonical/Schema setzen (/deon-ai/seo). */
+    public bool $allowSeoMeta = true;
+
+    /** Body bestehender Entries ändern, z. B. FAQ-Einbau (/deon-ai/faq). */
+    public bool $allowContentEdit = false;
+
+    /** Neue Entries anlegen: Blog sowie Standort-/Leistungs-/Faktenseiten (/deon-ai/entry, /deon-ai/page). */
+    public bool $allowPageCreate = false;
+
+    /** robots.txt/llms.txt lesen/schreiben (/deon-ai/files, /deon-ai/hygiene). */
+    public bool $allowFiles = false;
+
+    /** Bild-Uploads als Assets (/deon-ai/asset). */
+    public bool $allowAssets = false;
+
     public function defineRules(): array
     {
         return [
             [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'pagesSectionHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
-            [['injectSdk', 'manageRobotsLlms'], 'boolean'],
+            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets'], 'boolean'],
         ];
     }
 }

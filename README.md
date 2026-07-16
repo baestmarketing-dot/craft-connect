@@ -10,6 +10,7 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **Blog-Publishing** — Deon AI legt generierte Artikel direkt als Entries an (Entwurf oder live), inkl. Featured-Image-Upload und Duplikat-Check über bestehende Entries. Section und Body-Feld können pro Request überschrieben werden (Multi-Section-Publishing).
 - **Rollback-fähiges Änderungsprotokoll** — jede Deon-AI-Änderung speichert automatisch ihren Vorher-Zustand, bevor sie geschrieben wird. Kein separater Backup-Job, der ausfallen könnte: die Sicherung ist untrennbarer Teil derselben Datenbank-Transaktion wie die Änderung selbst und funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig).
 - **Native Content-Bausteine** — FAQ-Blöcke idempotent in bestehende Entries einbauen (`/deon-ai/faq`), Standort-/Faktenseiten als eigene Section anlegen (`/deon-ai/page`, Setting `pagesSectionHandle`), robots.txt/llms.txt direkt im Webroot lesen/schreiben (`/deon-ai/files`) — jeweils mit Backup vor dem Überschreiben.
+- **Berechtigungen** — der Kunde entscheidet im Control Panel selbst, was Deon AI ändern darf. Nicht freigegebene 1-Klick-Fixes werden im Deon-AI-Dashboard ausgegraut statt einen Fehler zu werfen.
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -39,6 +40,20 @@ So bleibt die Seite live erreichbar, falls eine Migration fehlschlägt — der F
 4. Zurück im Deon-AI-Wizard auf **Verifizieren** klicken — fertig.
 
 Für das Blog-Publishing: Section-Handle (Standard `blog`) und Body-Feld-Handle (Standard `body`) in den Plugin-Einstellungen an dein Schema anpassen. Für Featured Images zusätzlich Asset-Volume- und Bildfeld-Handle eintragen. Für robots.txt/llms.txt-Verwaltung den entsprechenden Schalter aktivieren (nur wirksam, wenn im Webroot noch keine physische robots.txt-Datei liegt).
+
+## Berechtigungen
+
+Unter **Einstellungen → Plugins → Deon AI Connect → Berechtigungen** legt der Kunde fest, was Deon AI eigenständig ändern darf — pro Kategorie ein Schalter:
+
+| Schalter | Standard | Gatet |
+| --- | --- | --- |
+| Title/Meta-Description/Canonical/Schema (`allowSeoMeta`) | an | `/deon-ai/seo` |
+| Inhalte bestehender Seiten bearbeiten (`allowContentEdit`) | aus | `/deon-ai/faq` |
+| Neue Seiten anlegen (`allowPageCreate`) | aus | `/deon-ai/entry`, `/deon-ai/page` |
+| robots.txt / llms.txt (`allowFiles`) | aus | `/deon-ai/files`, `/deon-ai/hygiene` |
+| Bild-Uploads (`allowAssets`) | aus | `/deon-ai/asset` |
+
+Nur SEO-Overrides sind standardmäßig aktiv, da sie rein serverseitig wirken und keinen Inhalt verändern. Ein Aufruf gegen einen nicht freigegebenen Endpoint liefert `403 { "ok": false, "error": "consent_required", "permission": "<key>" }`. `/deon-ai/ping` gibt den aktuellen Freigabe-Stand aller Kategorien im Feld `permissions` zurück, damit Deon AI nicht freigegebene 1-Klick-Fixes im Dashboard ausgrauen kann. Lese-Endpoints (`ping`, `seo-list`, `entries`, `hygiene-list`, `rollback/*`) sind bewusst nicht gegated — Rückgängig machen (Rollback) funktioniert unabhängig von diesen Schaltern immer.
 
 ## Änderungsprotokoll & Rollback
 
