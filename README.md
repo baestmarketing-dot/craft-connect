@@ -9,6 +9,7 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **robots.txt / llms.txt** — Deon AI kann KI-Crawler-Freigaben und llms.txt optional direkt am Origin ausliefern (Setting `manageRobotsLlms`).
 - **Blog-Publishing** — Deon AI legt generierte Artikel direkt als Entries an (Entwurf oder live), inkl. Featured-Image-Upload und Duplikat-Check über bestehende Entries. Section und Body-Feld können pro Request überschrieben werden (Multi-Section-Publishing).
 - **Rollback-fähiges Änderungsprotokoll** — jede Deon-AI-Änderung speichert automatisch ihren Vorher-Zustand, bevor sie geschrieben wird. Kein separater Backup-Job, der ausfallen könnte: die Sicherung ist untrennbarer Teil derselben Datenbank-Transaktion wie die Änderung selbst und funktioniert auf jedem Hosting (reines SQL, kein `shell_exec`/`mysqldump` nötig).
+- **Native Content-Bausteine** — FAQ-Blöcke idempotent in bestehende Entries einbauen (`/deon-ai/faq`), Standort-/Faktenseiten als eigene Section anlegen (`/deon-ai/page`, Setting `pagesSectionHandle`), robots.txt/llms.txt direkt im Webroot lesen/schreiben (`/deon-ai/files`) — jeweils mit Backup vor dem Überschreiben.
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -54,6 +55,14 @@ Die Endpoints folgen derselben `/rollback/*`-Konvention wie das WordPress-/TYPO3
 - `POST /deon-ai/rollback/restore-point` (Body `{ "label"? }`) — kompletter Sicherungspunkt: Snapshot aller aktuell verwalteten SEO-Overrides, robots.txt/llms.txt-Inhalte und Blog-Entries als ein wiederherstellbarer Punkt. Das ist die "einmal alles gesichert, bevor sich was ändert"-Aktion — als reines SQL-Snapshot, kein `shell_exec`/`mysqldump` nötig.
 
 Optional bei jedem Schreibaufruf ein `note`-Feld mitgeben (Freitext, z. B. "Grund der Änderung") — erscheint im Protokoll. Für einen kompletten Datenbank-Snapshot außerhalb dessen, was das Plugin selbst anfasst, bleibt zusätzlich Craft's eigenes `php craft db/backup` empfehlenswert — das braucht allerdings `mysqldump`/`pg_dump` per `shell_exec`, was auf manchen Shared-Hosting-Umgebungen gesperrt ist.
+
+## Native Content-Endpoints
+
+- `POST /deon-ai/files` — `{ op: "read"|"write", filename: "llms.txt"|"robots.txt", content? }`. Strikte Dateinamen-Whitelist, liest/schreibt direkt im Webroot. `write` sichert den bisherigen Inhalt vor dem Überschreiben.
+- `POST /deon-ai/faq` — `{ uri, faq_html, body_field? }`. Hängt einen FAQ-Block an den Entry-Body an (leere `uri`/`"/"` = Startseite). Idempotent: ein bereits vorhandener Block mit `data-deon-faq`-Marker wird ersetzt statt dupliziert.
+- `POST /deon-ai/page` — `{ title, slug?, body_html, status?, section?, entry_id? }`. Legt native Seiten an (Standortseiten, KI-Faktenseite). Section-Auflösung: `section`-Param → Setting `pagesSectionHandle` (Standard `pages`) → `blogSectionHandle`. Geht standardmäßig als Entwurf raus (`status` explizit `"live"` setzen für sofortige Veröffentlichung).
+
+Alle drei sichern den bisherigen Inhalt fail-soft in einer eigenen Tabelle, bevor sie etwas überschreiben — ein Backup-Fehler blockiert dabei nie den eigentlichen Fix.
 
 ## Sicherheit
 
