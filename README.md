@@ -13,7 +13,8 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **Berechtigungen** — der Kunde entscheidet im Control Panel selbst, was Deon AI ändern darf. Nicht freigegebene 1-Klick-Fixes werden im Deon-AI-Dashboard ausgegraut statt einen Fehler zu werfen.
 - **Remote-Self-Update** — Deon AI kann das Plugin bei neuen Versionen selbstständig per Composer aktualisieren, ohne dass jemand ins Control Panel muss. Craft spielt Plugin-Updates sonst nie automatisch ein.
 - **Blog-/Seiten-Bootstrap** — legt bei Bedarf Body-/Bildfeld und Blog-/Seiten-Section selbst an (`/deon-ai/setup-blog`), damit das Publishing auch auf einer frischen Craft-Installation ohne bestehendes Content-Schema funktioniert.
-- **Navigation** — verlinkt generierte Seiten automatisch in Hauptnavigation oder Footer (`/deon-ai/nav`), wenn das kostenlose Plugin [verbb/navigation](https://plugins.craftcms.com/navigation) installiert ist.
+- **Navigation** — verlinkt generierte Seiten automatisch in Hauptnavigation oder Footer (`/deon-ai/nav`), wenn das kostenlose Plugin [verbb/navigation](https://plugins.craftcms.com/navigation) installiert ist. Zusätzlich ein Plugin-eigener Footer-Block („Servicegebiete", `/deon-ai/footer-links`), der ohne Zusatz-Plugin funktioniert.
+- **Seiten-Anbindung** — Deon AI kann Craft-Seiten vollständig lesen (`/deon-ai/page-structure`), per URL finden (`/deon-ai/match-url`), im Original-Design klonen und texturieren (`/deon-ai/duplicate-page`, `/deon-ai/set-widget-texts`), als Full-Page-Landingpage publizieren (`/deon-ai/publish-lp`) und die Design-Tokens der Site extrahieren (`/deon-ai/theme-tokens`) — Contract-Parität zum WordPress-Plugin, gleiche Response-Shapes.
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -90,6 +91,21 @@ Auf einer frischen Craft-Installation ohne bestehendes Blog-Schema scheitert das
 1. Ist [verbb/navigation](https://plugins.craftcms.com/navigation) installiert (der De-facto-Standard für Craft-Navigationen), wählt das Plugin die passende Nav per Handle-/Namens-Heuristik (`main`/`haupt`/`primary` bzw. `footer`/`fuss`, sonst die erste vorhandene Nav) und legt einen Node an — dedupliziert über die Ziel-URL bzw. den verlinkten Entry. Antwort: `{ ok, via: "verbb", nav: { handle } }`.
 2. Sonst, falls eine Structure-Section mit Handle `nav`/`menu` existiert **und** deren Entry-Type ein Feld `linkUrl` oder `url` hat, wird dort ein Entry angelegt. Ohne ein eindeutiges Link-Feld wird nicht geraten.
 3. Sonst `422 { ok: false, error: "nav_not_automatable", hint: "…" }` mit dem Hinweis, den Link manuell im CP/Template zu setzen — und dem Tipp, dass Deon AI die Navigation mit dem kostenlosen verbb-Plugin automatisch pflegen kann.
+
+## Seiten-Anbindung
+
+Damit Deon AI Craft-Seiten analysieren, im Original-Design klonen und texturieren kann — Response-Shapes bewusst identisch zum WordPress-Plugin (aideon-connect), damit der Deon-AI-Worker beide Plattformen einheitlich anspricht:
+
+- `GET /deon-ai/match-url?url=…` — findet den Entry zu einer URL (`{ matched, id, title, slug, … }`)
+- `GET /deon-ai/pages?per_page=` — Entries **aller** Sections, nach Änderungsdatum absteigend
+- `GET /deon-ai/page-structure/<id>` — kompletter Seiteninhalt inkl. Body-HTML und walkbaren Text-Blöcken (`content_blocks`, IDs `pc-N`: h1–h3 = `title`, p = `editor`)
+- `POST /deon-ai/set-widget-texts` — `{ post_id, texts: [{ id: "pc-N", title?|editor? }] }` setzt Texte punktgenau in den Body (Reihenfolge identisch zu `page-structure`), mit Rollback-Protokoll. Berechtigung: `allowContentEdit`.
+- `POST /deon-ai/duplicate-page` — `{ source_post_id|source_page_url, title, replacements: [{find, replace}], h1_override?, page_id?, … }` klont eine Seite 1:1 (Craft-natives `duplicateElement`, alle Felder inkl. Bilder), tauscht Texte und legt sie als Entwurf an — der Standortseiten-Pfad. Idempotent per `page_id`. Berechtigung: `allowPageCreate`.
+- `GET /deon-ai/render-preview?post_id|url&token=` — liefert das gerenderte Frontend-HTML (für die Dashboard-Preview). Zweifach gesichert: `X-Deon-Key` **plus** kurzlebiges HMAC-Token (60 s), nur Same-Origin-URLs.
+- `POST /deon-ai/publish-lp` — Full-Page-Landingpage aus Roh-HTML inkl. `<style>`/`<script>` (eigene Tabelle + Route pro Slug, kein Entry). Hinweis: `chrome: "bare"` wird gespeichert, gerendert wird in Craft immer das Roh-HTML als eigenständiges Dokument — es gibt kein Theme, in das sich „bare" einbetten ließe. Berechtigung: `allowPageCreate`.
+- `GET /deon-ai/theme-tokens` — Farben/Fonts/Radius/Palette der Site. Craft hat kein theme.json wie WordPress-Block-Themes, deshalb extrahiert das Plugin die Tokens aus dem CSS der gerenderten Startseite (`<style>`-Blöcke + Same-Origin-Stylesheets, `var(--x)` wird eine Ebene aufgelöst) — `source: "css_extract"`, best-effort; der Worker-Normalizer wählt aus der Palette notfalls selbst.
+- `POST /deon-ai/site-schema` — Site-weites JSON-LD, ausgespielt im `<head>` aller Seiten. Berechtigung: `allowSeoMeta`.
+- `GET|POST /deon-ai/footer-links` — Plugin-eigener Footer-Block („Servicegebiete"-Links), gerendert vor `</body>`, ohne Zusatz-Plugin. Berechtigung (POST): `allowNavEdit`.
 
 ## Änderungsprotokoll & Rollback
 

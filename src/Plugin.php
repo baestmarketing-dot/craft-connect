@@ -28,7 +28,7 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.3.0';
+    public string $schemaVersion = '1.4.0';
     public bool $hasCpSettings = true;
 
     private const BOOTSTRAP_URL = 'https://audit.deon-ai.de/api/plugin/craft/bootstrap';
@@ -76,6 +76,34 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/up'] = 'deon-ai-connect/api/up';
                 $event->rules['deon-ai/setup-blog'] = 'deon-ai-connect/api/setup-blog';
                 $event->rules['deon-ai/nav'] = 'deon-ai-connect/api/nav';
+                // v0.8.0 — Seiten-Anbindung (Contract-Parität zum WordPress-Plugin aideon-connect)
+                $event->rules['deon-ai/match-url'] = 'deon-ai-connect/api/match-url';
+                $event->rules['deon-ai/pages'] = 'deon-ai-connect/api/pages';
+                $event->rules['deon-ai/page-structure/<id:\d+>'] = 'deon-ai-connect/api/page-structure';
+                $event->rules['deon-ai/set-widget-texts'] = 'deon-ai-connect/api/set-widget-texts';
+                $event->rules['deon-ai/duplicate-page'] = 'deon-ai-connect/api/duplicate-page';
+                $event->rules['deon-ai/render-preview'] = 'deon-ai-connect/api/render-preview';
+                $event->rules['deon-ai/publish-lp'] = 'deon-ai-connect/api/publish-lp';
+                $event->rules['deon-ai/theme-tokens'] = 'deon-ai-connect/api/theme-tokens';
+                $event->rules['deon-ai/site-schema'] = 'deon-ai-connect/api/site-schema';
+                $event->rules['deon-ai/sitemap-discover'] = 'deon-ai-connect/api/sitemap-discover';
+                $event->rules['deon-ai/footer-links'] = 'deon-ai-connect/api/footer-links';
+
+                // Full-Page-Landingpages (/deon-ai/publish-lp): eine Route pro
+                // aktivem Slug. Fail-soft: Tabelle existiert vor der Migration
+                // noch nicht — dann einfach keine LP-Routen.
+                try {
+                    $lpSlugs = (new \craft\db\Query())
+                        ->select(['slug'])
+                        ->from('{{%deonai_landing_pages}}')
+                        ->where(['enabled' => true])
+                        ->column();
+                    foreach ($lpSlugs as $lpSlug) {
+                        $event->rules[$lpSlug] = ['route' => 'deon-ai-connect/api/render-lp', 'params' => ['slug' => $lpSlug]];
+                    }
+                } catch (\Throwable $e) {
+                    // Tabelle fehlt (Migration nicht gelaufen) → keine LP-Routen.
+                }
                 $event->rules['deon-ai/seo'] = 'deon-ai-connect/api/set-seo';
                 $event->rules['deon-ai/seo-list'] = 'deon-ai-connect/api/list-seo';
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
@@ -274,9 +302,20 @@ class Plugin extends BasePlugin
                     . ' async></script>';
             }
 
+            // 4) Site-weites JSON-LD (/deon-ai/site-schema) — Organization/LocalBusiness etc.
+            $inject .= $this->renderSiteSchema();
+
             if ($inject !== '') {
                 $html = preg_replace('~</head>~i', $inject . '</head>', $html, 1);
             }
+
+            // 5) Footer-Links-Block (/deon-ai/footer-links) — Servicegebiete o. Ä.,
+            // vor </body>, analog zum wp_footer-Hook des WordPress-Plugins.
+            $footerHtml = $this->renderFooterLinks();
+            if ($footerHtml !== '' && stripos($html, '</body>') !== false) {
+                $html = preg_replace('~</body>~i', $footerHtml . '</body>', $html, 1);
+            }
+
             $response->data = $html;
         } catch (\Throwable $e) {
             // Fail-soft: das Plugin darf NIE die Seitenauslieferung brechen.
@@ -295,6 +334,86 @@ class Plugin extends BasePlugin
             return $row ?: null;
         } catch (\Throwable $e) {
             return null; // Tabelle fehlt (Migration nicht gelaufen) → kein Patch
+        }
+    }
+
+    /** Site-weites JSON-LD als <script>-Tags (gespeichert via /deon-ai/site-schema). */
+    private function renderSiteSchema(): string
+    {
+        try {
+            $json = (new \craft\db\Query())
+                ->select(['content'])
+                ->from('{{%deonai_seo_hygiene}}')
+                ->where(['type' => 'site_schema'])
+                ->scalar();
+            if (!$json) {
+                return '';
+            }
+            $schemas = json_decode((string)$json, true);
+            if (!is_array($schemas)) {
+                return '';
+            }
+            $out = '';
+            foreach (array_slice($schemas, 0, 10) as $schema) {
+                if (!is_array($schema)) {
+                    continue;
+                }
+                $out .= '<script type="application/ld+json">'
+                    . json_encode($schema, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+                    . '</script>';
+            }
+            return $out;
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
+    /**
+     * Footer-Links-Block (gespeichert via /deon-ai/footer-links) — Markup und
+     * Inline-Styles bewusst identisch zum wp_footer-Hook des WordPress-Plugins,
+     * damit Standortseiten-Verlinkung auf beiden Plattformen gleich aussieht.
+     */
+    private function renderFooterLinks(): string
+    {
+        try {
+            $json = (new \craft\db\Query())
+                ->select(['content'])
+                ->from('{{%deonai_seo_hygiene}}')
+                ->where(['type' => 'footer_links'])
+                ->scalar();
+            if (!$json) {
+                return '';
+            }
+            $data = json_decode((string)$json, true);
+            if (!is_array($data) || empty($data['links']) || !is_array($data['links'])) {
+                return '';
+            }
+            $items = [];
+            foreach (array_slice($data['links'], 0, 20) as $link) {
+                if (!is_array($link) || empty($link['page_id'])) {
+                    continue;
+                }
+                $entry = \craft\elements\Entry::find()->id((int)$link['page_id'])->one(); // nur live-Entries (Default-Status-Filter)
+                if (!$entry || !$entry->getUrl()) {
+                    continue;
+                }
+                $label = !empty($link['label']) ? (string)$link['label'] : (string)$entry->title;
+                if ($label === '') {
+                    continue;
+                }
+                $items[] = '<a href="' . htmlspecialchars($entry->getUrl(), ENT_QUOTES) . '" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">'
+                    . htmlspecialchars($label, ENT_QUOTES) . '</a>';
+            }
+            if (empty($items)) {
+                return '';
+            }
+            $heading = !empty($data['heading']) ? (string)$data['heading'] : 'Servicegebiete';
+            return "\n" . '<nav class="deon-footer-links" aria-label="' . htmlspecialchars($heading, ENT_QUOTES) . '" style="max-width:1140px;margin:0 auto;padding:18px 16px;font-size:13px;line-height:2.1;opacity:.78;text-align:center;color:inherit;">'
+                . '<span style="font-weight:600;margin-right:10px;">' . htmlspecialchars($heading, ENT_QUOTES) . ':</span>'
+                . implode(' <span aria-hidden="true">&middot;</span> ', $items)
+                . '</nav>' . "\n";
+        } catch (\Throwable $e) {
+            return '';
         }
     }
 }

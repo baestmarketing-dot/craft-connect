@@ -84,6 +84,15 @@ class ApiController extends Controller
             // (proc_open, Speicher, composer.phar) — unabhängig von der Freigabe
             // durch die Kundin, die unter permissions.self_update steht.
             'self_update' => $selfUpdateCapable,
+            // Feature-Liste dieser Plugin-Version — Namensschema wie WP /capabilities,
+            // damit der Worker beide Plattformen einheitlich gaten kann.
+            'capabilities' => [
+                'seo_meta', 'create_post', 'faq_inject', 'seo_files', 'rollback',
+                'setup_blog', 'nav_edit', 'self_update',
+                'url_match', 'page_structure', 'render_preview', 'duplicate_page',
+                'widget_texts', 'publish_lp', 'theme_tokens', 'seo_schema',
+                'sitemap_discover', 'footer_links',
+            ],
             'sections_ok' => [
                 'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
                 'pages' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->pagesSectionHandle ?: $settings->blogSectionHandle),
@@ -1107,6 +1116,857 @@ TWIG;
         return $this->asJson(['ok' => true, 'via' => 'structure', 'section' => $navSection->handle, 'entry_id' => $entry->id]);
     }
 
+    // ─── v0.8.0: Seiten-Anbindung (Contract-Parität zu aideon-connect/WP) ───
+
+    /**
+     * GET /deon-ai/match-url?url=… — Entry per URL finden.
+     * Response-Shape wie WP /match-url: { matched, id, title, slug, type,
+     * status, link, modified } bzw. { matched: false, searched_url, message }.
+     */
+    public function actionMatchUrl(): Response
+    {
+        $this->requireDeonKey();
+        $url = trim((string)Craft::$app->getRequest()->getQueryParam('url'));
+        if ($url === '') {
+            return $this->asJson(['ok' => false, 'error' => 'url parameter required'])->setStatusCode(400);
+        }
+
+        $path = parse_url($url, PHP_URL_PATH) ?? '';
+        $uri = trim((string)$path, '/');
+        $entry = Entry::find()->uri($uri === '' ? '__home__' : $uri)->status(null)->one();
+        if (!$entry && $uri !== '') {
+            // Fallback: letztes Pfadsegment als Slug (analog WP get_page_by_path-Fallback)
+            $entry = Entry::find()->slug(basename($uri))->status(null)->one();
+        }
+
+        if (!$entry) {
+            return $this->asJson([
+                'matched' => false,
+                'searched_url' => $url,
+                'message' => 'Keine Seite gefunden — versuche manuelle Auswahl aus /pages',
+            ]);
+        }
+        return $this->asJson($this->entrySummary($entry) + ['matched' => true]);
+    }
+
+    /**
+     * GET /deon-ai/pages?per_page=… — Entries ALLER Sections (WP-/pages-Shape),
+     * nach Änderungsdatum absteigend. Ergänzt /entries (eine Section pro Aufruf).
+     */
+    public function actionPages(): Response
+    {
+        $this->requireDeonKey();
+        $perPage = min((int)(Craft::$app->getRequest()->getQueryParam('per_page') ?: 100), 200);
+        $entries = Entry::find()
+            ->status(null)
+            ->orderBy(['dateUpdated' => SORT_DESC])
+            ->limit($perPage)
+            ->all();
+        return $this->asJson(array_map(fn(Entry $e) => $this->entrySummary($e), $entries));
+    }
+
+    /**
+     * GET /deon-ai/page-structure/<id> — kompletter Seiteninhalt zum Analysieren/
+     * Nachbauen: Titel, Slug, Body-HTML, SEO-Override der URI sowie walkbare
+     * Text-Blöcke (id "pc-N", Contract identisch zum WP-Plugin: h1–h3 = "title",
+     * p = "editor") für die builder-agnostische Standortseiten-Texturierung.
+     */
+    public function actionPageStructure(int $id): Response
+    {
+        $this->requireDeonKey();
+        $entry = Entry::find()->id($id)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+
+        [$bodyHandle, $bodyHtml] = $this->resolveEntryBody($entry);
+
+        $data = $this->entrySummary($entry);
+        $data['content'] = $bodyHtml;
+        $data['body_field'] = $bodyHandle;
+
+        $uri = '/' . ltrim((string)($entry->uri === '__home__' ? '' : $entry->uri), '/');
+        $override = (new \craft\db\Query())->from('{{%deonai_seo_overrides}}')->where(['uri' => $uri])->one();
+        if ($override) {
+            $data['seo'] = [
+                'title' => $override['title'],
+                'description' => $override['metaDescription'],
+                'canonical' => $override['canonical'],
+                'robots_noindex' => '',
+            ];
+        }
+
+        $blocks = $this->contentBlocks($bodyHtml);
+        if (!empty($blocks)) {
+            $out = [];
+            foreach ($blocks as $i => $block) {
+                $text = trim(strip_tags($block['inner']));
+                if ($text === '') {
+                    continue;
+                }
+                $out[] = ['id' => 'pc-' . $i, 'kind' => $block['kind'], 'text' => $text];
+            }
+            if (!empty($out)) {
+                $data['content_blocks'] = $out;
+                $data['content_builder'] = 'html';
+            }
+        }
+
+        return $this->asJson($data);
+    }
+
+    /**
+     * POST /deon-ai/set-widget-texts — Text-Sets per Block-ID "pc-N" auf den
+     * Entry-Body anwenden (N-ter h1–h3- bzw. p-Block, Reihenfolge identisch zu
+     * /page-structure). Body: { post_id|entry_id, texts: [{id, title?|editor?}], body_field? }
+     * Contract = WP-Plugin aideon_apply_content_texts (html-Modus).
+     */
+    public function actionSetWidgetTexts(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $entryId = (int)($body['post_id'] ?? $body['entry_id'] ?? 0);
+        $texts = is_array($body['texts'] ?? null) ? $body['texts'] : [];
+        if (!$entryId) {
+            return $this->asJson(['ok' => false, 'error' => 'post_id fehlt/unbekannt'])->setStatusCode(404);
+        }
+        if (empty($texts)) {
+            return $this->asJson(['ok' => false, 'error' => 'texts[] erforderlich'])->setStatusCode(400);
+        }
+        $entry = Entry::find()->id($entryId)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'post_id fehlt/unbekannt'])->setStatusCode(404);
+        }
+
+        [$bodyHandle, $content] = $this->resolveEntryBody($entry, !empty($body['body_field']) ? (string)$body['body_field'] : null);
+        if ($bodyHandle === null) {
+            return $this->asJson(['ok' => false, 'error' => 'body_field_not_found'])->setStatusCode(422);
+        }
+
+        $beforeState = [
+            'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+            'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $content,
+        ];
+
+        $blocks = $this->contentBlocks($content);
+        $map = [];
+        foreach ($texts as $t) {
+            if (is_array($t) && !empty($t['id']) && str_starts_with((string)$t['id'], 'pc-')) {
+                $map[(int)substr((string)$t['id'], 3)] = $t;
+            }
+        }
+
+        $applied = [];
+        // Absteigend anwenden, damit die vorherigen pos-Offsets gültig bleiben.
+        for ($i = count($blocks) - 1; $i >= 0; $i--) {
+            if (!isset($map[$i])) {
+                continue;
+            }
+            $block = $blocks[$i];
+            $t = $map[$i];
+            $newInner = null;
+            if ($block['kind'] === 'title' && isset($t['title']) && is_string($t['title'])) {
+                $newInner = htmlspecialchars(trim(strip_tags($t['title'])), ENT_QUOTES);
+            } elseif ($block['kind'] === 'editor' && isset($t['editor']) && is_string($t['editor'])) {
+                $newInner = $t['editor'];
+            }
+            if ($newInner === null || $newInner === '') {
+                continue;
+            }
+            $innerPos = strpos($block['full'], $block['inner']);
+            if ($innerPos === false) {
+                continue;
+            }
+            $newFull = substr_replace($block['full'], $newInner, $innerPos, strlen($block['inner']));
+            $content = substr_replace($content, $newFull, $block['pos'], strlen($block['full']));
+            $applied[] = 'pc-' . $i;
+        }
+
+        if (!empty($applied)) {
+            try {
+                $entry->setFieldValue($bodyHandle, $content);
+            } catch (\Throwable $e) {
+                return $this->asJson(['ok' => false, 'error' => 'body_field_not_found'])->setStatusCode(422);
+            }
+            if (!Craft::$app->getElements()->saveElement($entry)) {
+                return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+            }
+            $afterState = $beforeState;
+            $afterState['bodyValue'] = $content;
+            $this->logChange('entry', (string)$entry->id, $beforeState, $afterState, 'set-widget-texts');
+        }
+
+        return $this->asJson([
+            'success' => true,
+            'applied' => $applied,
+            'count' => count($applied),
+            'mode' => 'html',
+            'plugin_version' => Plugin::getInstance()->getVersion(),
+        ]);
+    }
+
+    /**
+     * POST /deon-ai/duplicate-page — 1:1-Klon einer Seite mit Textaustausch
+     * (Standortseiten im Original-Design). Contract = WP /duplicate-page:
+     * Body: { source_post_id?|source_page_url?, title, slug?, replacements:
+     * [{find, replace}], h1_override?, status?, page_id?, meta_description?,
+     * seo_title?, schema_json? }. page_id = idempotentes Re-Run (Update).
+     */
+    public function actionDuplicatePage(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('page_create')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $source = null;
+        if (!empty($body['source_post_id'])) {
+            $source = Entry::find()->id((int)$body['source_post_id'])->status(null)->one();
+        } elseif (!empty($body['source_page_url'])) {
+            $path = trim((string)(parse_url((string)$body['source_page_url'], PHP_URL_PATH) ?? ''), '/');
+            $source = Entry::find()->uri($path === '' ? '__home__' : $path)->status(null)->one();
+        }
+        if (!$source) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found', 'message' => 'Quellseite nicht gefunden'])->setStatusCode(404);
+        }
+
+        $title = trim((string)($body['title'] ?? ''));
+        if ($title === '') {
+            return $this->asJson(['ok' => false, 'error' => 'title erforderlich'])->setStatusCode(400);
+        }
+        $slug = trim((string)($body['slug'] ?? ''));
+        $status = (string)($body['status'] ?? 'draft');
+        $replacements = [];
+        foreach ((is_array($body['replacements'] ?? null) ? $body['replacements'] : []) as $r) {
+            if (is_array($r) && isset($r['find']) && $r['find'] !== '' && isset($r['replace'])) {
+                $replacements[] = ['find' => (string)$r['find'], 'replace' => (string)$r['replace']];
+            }
+        }
+        $h1Override = trim((string)($body['h1_override'] ?? ''));
+
+        [$bodyHandle, $sourceHtml] = $this->resolveEntryBody($source);
+
+        // Textaustausch auf Body-HTML (alle find/replace-Paare)
+        $newHtml = $sourceHtml;
+        foreach ($replacements as $r) {
+            $newHtml = str_replace($r['find'], $r['replace'], $newHtml);
+        }
+        // h1_override: inneren Text des ERSTEN h1–h3 ersetzen (wie WP: erstes Heading-Widget)
+        if ($h1Override !== '') {
+            $newHtml = preg_replace(
+                '~(<h([1-3])\b[^>]*>).*?(</h\2>)~is',
+                '$1' . str_replace(['\\', '$'], ['\\\\', '\$'], htmlspecialchars($h1Override, ENT_QUOTES)) . '$3',
+                $newHtml,
+                1
+            );
+        }
+
+        $existing = null;
+        if (!empty($body['page_id'])) {
+            $existing = Entry::find()->id((int)$body['page_id'])->status(null)->one();
+        }
+
+        $beforeState = null;
+        try {
+            if ($existing) {
+                // Idempotentes Re-Run: bestehenden Klon aktualisieren statt neu anlegen
+                $entry = $existing;
+                $beforeState = [
+                    'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+                    'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $bodyHandle !== null ? $this->safeFieldString($entry, $bodyHandle) : '',
+                ];
+            } else {
+                $entry = Craft::$app->getElements()->duplicateElement($source, [
+                    'title' => mb_substr($title, 0, 255),
+                ]);
+            }
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'duplicate_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+
+        $entry->title = mb_substr($title, 0, 255);
+        $entry->slug = mb_substr($slug !== '' ? $slug : \craft\helpers\ElementHelper::generateSlug($title), 0, 200);
+        $entry->enabled = ($status === 'publish' || $status === 'live');
+        if ($bodyHandle !== null) {
+            try {
+                $entry->setFieldValue($bodyHandle, $newHtml);
+            } catch (\Throwable $e) {
+                // Feld existiert im Ziel nicht mehr — Klon trotzdem speichern.
+            }
+        }
+
+        if (!Craft::$app->getElements()->saveElement($entry)) {
+            return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+        }
+
+        // SEO-Metas als Override auf die neue URI (unser natives Pendant zu Yoast-Postmeta)
+        if ($entry->uri && (!empty($body['meta_description']) || !empty($body['seo_title']) || !empty($body['schema_json']))) {
+            $this->upsertSeoOverrideRow('/' . ltrim($entry->uri === '__home__' ? '' : $entry->uri, '/'), [
+                'title' => !empty($body['seo_title']) ? mb_substr((string)$body['seo_title'], 0, 200) : null,
+                'metaDescription' => !empty($body['meta_description']) ? mb_substr((string)$body['meta_description'], 0, 300) : null,
+                'schemaJson' => !empty($body['schema_json']) ? json_encode($body['schema_json'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : null,
+            ]);
+        }
+
+        $changeId = $this->logChange('entry', (string)$entry->id, $beforeState, [
+            'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+            'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $bodyHandle !== null ? $this->safeFieldString($entry, $bodyHandle) : '',
+        ], 'duplicate-page von #' . $source->id);
+
+        return $this->asJson([
+            'success' => true,
+            'post_id' => $entry->id,
+            'source_post_id' => $source->id,
+            'builder' => 'craft',
+            'page_url' => $entry->getUrl(),
+            'status' => $entry->enabled ? 'publish' : 'draft',
+            'rollback_id' => 'rb_' . $changeId,
+            'plugin_version' => Plugin::getInstance()->getVersion(),
+        ]);
+    }
+
+    /**
+     * GET /deon-ai/render-preview?post_id|url&token — gerendertes Frontend-HTML
+     * für die Dashboard-Preview. Token-Format identisch zum WP-Plugin:
+     * base64url(hmac_sha256("<url>:<exp>", apiKey)) . "." . exp (60s-TTL,
+     * max. 10 min in der Zukunft). Nur Same-Origin-URLs.
+     */
+    public function actionRenderPreview(): Response
+    {
+        $this->requireDeonKey();
+        $request = Craft::$app->getRequest();
+        $entryId = (int)$request->getQueryParam('post_id');
+        $urlParam = trim((string)$request->getQueryParam('url'));
+        $token = (string)$request->getQueryParam('token');
+
+        $entry = $entryId ? Entry::find()->id($entryId)->status(null)->one() : null;
+        if (!$entry && $urlParam === '') {
+            return $this->asJson(['ok' => false, 'error' => 'post_id or url required'])->setStatusCode(400);
+        }
+        $url = $entry ? (string)$entry->getUrl() : $urlParam;
+        if ($url === '') {
+            return $this->asJson(['ok' => false, 'error' => 'entry_has_no_url'])->setStatusCode(422);
+        }
+
+        // Same-Origin-Guard: nur der eigene Site-Host
+        $ownHost = strtolower((string)parse_url((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), PHP_URL_HOST));
+        $urlHost = strtolower((string)parse_url($url, PHP_URL_HOST));
+        if ($ownHost === '' || $urlHost === '' || preg_replace('/^www\./', '', $urlHost) !== preg_replace('/^www\./', '', $ownHost)) {
+            return $this->asJson(['ok' => false, 'error' => 'ssrf_blocked', 'message' => 'Nur Same-Origin-URLs erlaubt'])->setStatusCode(403);
+        }
+
+        if (!$this->verifyPreviewToken($token, $url)) {
+            return $this->asJson(['ok' => false, 'error' => 'invalid_token', 'message' => 'Preview-Token fehlt oder ist abgelaufen (60s TTL). Worker muss neues Token erzeugen.'])->setStatusCode(401);
+        }
+
+        $html = '';
+        try {
+            $client = Craft::createGuzzleClient(['timeout' => 15]);
+            $fetched = $client->request('GET', $url, [
+                'http_errors' => false,
+                'headers' => ['User-Agent' => 'DeonAiConnect/' . Plugin::getInstance()->getVersion() . ' (preview)'],
+            ]);
+            if ($fetched->getStatusCode() < 400) {
+                $html = (string)$fetched->getBody();
+            }
+        } catch (\Throwable $e) {
+            // Fallback unten
+        }
+        if (strlen($html) < 200 && $entry) {
+            // Fallback: Body-Feld ohne Theme-Wrap (analog aideon_render_post_internal)
+            [, $bodyHtml] = $this->resolveEntryBody($entry);
+            $html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' . htmlspecialchars((string)$entry->title, ENT_QUOTES) . '</title></head><body>' . $bodyHtml . '</body></html>';
+        }
+
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->headers->set('Content-Type', 'text/html; charset=utf-8');
+        $response->headers->set('Cache-Control', 'no-store');
+        $response->headers->set('Content-Security-Policy', "frame-ancestors 'self' https://audit.deon-ai.de https://deon-ai.de");
+        $response->data = $html;
+        return $response;
+    }
+
+    /**
+     * POST /deon-ai/publish-lp — Full-Page-Landingpage aus Roh-HTML (inkl.
+     * <style>/<script>), ausgeliefert über eine eigene Route pro Slug.
+     * Contract = WP /publish-lp; "chrome" wird gespeichert, gerendert wird
+     * immer das Roh-HTML als komplettes Dokument (Craft hat kein Theme, in
+     * das sich "bare" einbetten ließe — im Response dokumentiert).
+     */
+    public function actionPublishLp(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('page_create')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $title = trim((string)($body['title'] ?? ''));
+        $rawHtml = is_string($body['html'] ?? null) ? $body['html'] : '';
+        if ($title === '' || strlen($rawHtml) < 20) {
+            return $this->asJson(['ok' => false, 'error' => 'title und html (min. 20 Zeichen) erforderlich'])->setStatusCode(400);
+        }
+        $chrome = in_array($body['chrome'] ?? 'full', ['full', 'bare'], true) ? (string)$body['chrome'] : 'full';
+        $status = (string)($body['status'] ?? 'draft');
+        $enabled = ($status === 'publish' || $status === 'live');
+        $slug = trim((string)($body['slug'] ?? ''), '/');
+        if ($slug === '') {
+            $slug = \craft\helpers\ElementHelper::generateSlug($title);
+        }
+        $slug = mb_substr($slug, 0, 200);
+
+        $db = Craft::$app->getDb();
+        $table = '{{%deonai_landing_pages}}';
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+
+        $existing = null;
+        if (!empty($body['page_id'])) {
+            $existing = (new \craft\db\Query())->from($table)->where(['id' => (int)$body['page_id']])->one();
+        }
+        if (!$existing) {
+            $existing = (new \craft\db\Query())->from($table)->where(['slug' => $slug])->one();
+        }
+
+        try {
+            if ($existing) {
+                $this->backupContent('lp:' . $existing['slug'], (string)$existing['html']);
+                $db->createCommand()->update($table, [
+                    'slug' => $slug, 'title' => mb_substr($title, 0, 255), 'html' => $rawHtml,
+                    'chrome' => $chrome, 'enabled' => $enabled, 'dateUpdated' => $now,
+                ], ['id' => $existing['id']])->execute();
+                $lpId = (int)$existing['id'];
+            } else {
+                $db->createCommand()->insert($table, [
+                    'slug' => $slug, 'title' => mb_substr($title, 0, 255), 'html' => $rawHtml,
+                    'chrome' => $chrome, 'enabled' => $enabled,
+                    'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+                ])->execute();
+                $lpId = (int)$db->getLastInsertID();
+            }
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'lp_save_failed', 'message' => $e->getMessage(), 'hint' => 'Migration gelaufen? (deonai_landing_pages)'])->setStatusCode(500);
+        }
+
+        $baseUrl = rtrim((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), '/');
+        return $this->asJson([
+            'success' => true,
+            'post_id' => $lpId,
+            'page_url' => $baseUrl . '/' . $slug,
+            'status' => $enabled ? 'publish' : 'draft',
+            'chrome' => $chrome,
+            'render_mode' => 'fullpage_raw',
+            'plugin_version' => Plugin::getInstance()->getVersion(),
+        ]);
+    }
+
+    /** Liefert eine Landingpage aus (Site-Route pro Slug, siehe Plugin::init()). */
+    public function actionRenderLp(string $slug): Response
+    {
+        $row = (new \craft\db\Query())
+            ->from('{{%deonai_landing_pages}}')
+            ->where(['slug' => $slug, 'enabled' => true])
+            ->one();
+        if (!$row) {
+            throw new NotFoundHttpException();
+        }
+        $html = (string)$row['html'];
+        if (stripos($html, '<html') === false) {
+            $html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' . htmlspecialchars((string)$row['title'], ENT_QUOTES) . '</title><meta name="viewport" content="width=device-width, initial-scale=1"></head><body>' . $html . '</body></html>';
+        }
+        $response = Craft::$app->getResponse();
+        $response->format = Response::FORMAT_RAW;
+        $response->headers->set('Content-Type', 'text/html; charset=utf-8');
+        $response->data = $html;
+        return $response;
+    }
+
+    /**
+     * GET /deon-ai/theme-tokens — Design-Tokens der Site. Craft hat kein
+     * theme.json (WP-Weg: deklarierte Tokens auslesen) — stattdessen werden
+     * die Tokens aus dem CSS der gerenderten Startseite extrahiert: <style>-
+     * Blöcke + Same-Origin-Stylesheets, :root-Custom-Properties werden eine
+     * Ebene aufgelöst. Response-Shape wie WP (source: "css_extract").
+     */
+    public function actionThemeTokens(): Response
+    {
+        $this->requireDeonKey();
+        $out = ['is_block_theme' => false, 'palette' => [], 'source' => 'none'];
+
+        $css = $this->collectSiteCss();
+        if ($css !== '') {
+            $out['source'] = 'css_extract';
+
+            // :root-Custom-Properties einsammeln (eine Auflösungs-Ebene für var(--x))
+            $vars = [];
+            if (preg_match_all('/--([\w-]+)\s*:\s*([^;}]+)[;}]/', $css, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $vars[strtolower($m[1])] = trim($m[2]);
+                }
+            }
+            $resolve = static function (string $value) use ($vars): string {
+                $value = trim($value);
+                if (preg_match('/var\(\s*--([\w-]+)\s*(?:,\s*([^)]+))?\)/i', $value, $m)) {
+                    $value = trim($vars[strtolower($m[1])] ?? ($m[2] ?? ''));
+                }
+                return $value;
+            };
+            $isColor = static fn(string $v): bool => (bool)preg_match('/^#[0-9a-f]{3,8}$/i', $v) || stripos($v, 'rgb') === 0 || stripos($v, 'hsl') === 0;
+
+            // body-Regel: Hintergrund, Textfarbe, Body-Font
+            if (preg_match('/(?:^|[}\s,])body\s*(?:,[^{]*)?\{([^}]*)\}/is', $css, $m)) {
+                $decl = $m[1];
+                if (preg_match('/background(?:-color)?\s*:\s*([^;}]+)/i', $decl, $mm) && $isColor($v = $resolve($mm[1]))) {
+                    $out['color_bg'] = $v;
+                }
+                if (preg_match('/(?<![\w-])color\s*:\s*([^;}]+)/i', $decl, $mm) && $isColor($v = $resolve($mm[1]))) {
+                    $out['color_text'] = $v;
+                }
+                if (preg_match('/font-family\s*:\s*([^;}]+)/i', $decl, $mm) && ($v = $resolve($mm[1])) !== '') {
+                    $out['font_body'] = $v;
+                }
+            }
+            // Heading-Font (h1/h2/h3-Regeln)
+            if (preg_match('/h[1-3][^{]*\{[^}]*font-family\s*:\s*([^;}]+)/is', $css, $m) && ($v = $resolve($m[1])) !== '') {
+                $out['font_heading'] = $v;
+            }
+            // Button: Akzentfarbe + Radius
+            if (preg_match('/(?:button|\.btn|\.button)[^{]*\{([^}]*)\}/is', $css, $m)) {
+                $decl = $m[1];
+                if (preg_match('/background(?:-color)?\s*:\s*([^;}]+)/i', $decl, $mm) && $isColor($v = $resolve($mm[1]))) {
+                    $out['color_accent'] = $v;
+                }
+                if (preg_match('/border-radius\s*:\s*([^;}]+)/i', $decl, $mm) && ($v = $resolve($mm[1])) !== '') {
+                    $out['radius'] = $v;
+                }
+            }
+            // Akzent-Fallback: Link-Farbe
+            if (empty($out['color_accent']) && preg_match('/(?:^|[}\s,])a\s*(?:,[^{]*)?\{[^}]*(?<![\w-])color\s*:\s*([^;}]+)/is', $css, $m) && $isColor($v = $resolve($m[1]))) {
+                $out['color_accent'] = $v;
+            }
+
+            // Palette: häufigste Hex-Farben im CSS (Worker-Normalizer wählt selbst)
+            if (preg_match_all('/#[0-9a-f]{6}\b|#[0-9a-f]{3}\b/i', $css, $m)) {
+                $counts = array_count_values(array_map('strtolower', $m[0]));
+                arsort($counts);
+                $i = 1;
+                foreach (array_slice(array_keys($counts), 0, 8) as $color) {
+                    $out['palette'][] = ['slug' => 'c' . $i++, 'color' => $color];
+                }
+            }
+        }
+
+        $out['plugin_version'] = Plugin::getInstance()->getVersion();
+        return $this->asJson($out);
+    }
+
+    /**
+     * POST /deon-ai/site-schema — Site-weites JSON-LD (Organization/
+     * LocalBusiness/WebSite), ausgespielt im <head> aller Seiten.
+     * Body: { schemas: [ {...}, ... ] } (max. 10). Contract = WP /site-schema.
+     */
+    public function actionSiteSchema(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('seo_meta')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $schemas = Craft::$app->getRequest()->getBodyParam('schemas');
+        if (!is_array($schemas)) {
+            return $this->asJson(['ok' => false, 'error' => 'Feld "schemas" muss ein Array von JSON-LD-Objekten sein.'])->setStatusCode(400);
+        }
+        $clean = [];
+        foreach (array_slice($schemas, 0, 10) as $schema) {
+            if (is_array($schema)) {
+                $clean[] = $schema;
+            }
+        }
+
+        $db = Craft::$app->getDb();
+        $table = '{{%deonai_seo_hygiene}}';
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        $existing = (new \craft\db\Query())->from($table)->where(['type' => 'site_schema'])->one();
+        $json = json_encode($clean, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        if ($existing) {
+            $this->backupContent('site_schema', (string)$existing['content']);
+            $db->createCommand()->update($table, ['content' => $json, 'dateUpdated' => $now], ['id' => $existing['id']])->execute();
+        } else {
+            $db->createCommand()->insert($table, [
+                'type' => 'site_schema', 'content' => $json,
+                'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+            ])->execute();
+        }
+
+        return $this->asJson(['ok' => true, 'count' => count($clean)]);
+    }
+
+    /** GET /deon-ai/sitemap-discover — wahrscheinlichste Sitemap-URL (Contract = WP /seo/sitemap/discover). */
+    public function actionSitemapDiscover(): Response
+    {
+        $this->requireDeonKey();
+        $base = rtrim((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), '/') . '/';
+        // Craft-Core hat keine Sitemap; SEOmatic (De-facto-Standard) liefert /sitemaps-1-sitemap.xml + sitemap.xml-Redirect.
+        $candidates = [$base . 'sitemap.xml', $base . 'sitemaps-1-sitemap.xml', $base . 'sitemap_index.xml'];
+        return $this->asJson(['ok' => true, 'sitemap_url' => $candidates[0], 'candidates' => $candidates]);
+    }
+
+    /**
+     * GET|POST /deon-ai/footer-links — Plugin-eigener Footer-Block
+     * ("Servicegebiete"), gerendert vor </body> auf allen Seiten.
+     * POST-Body: { heading?, links: [{page_id, label}], merge? } — Contract = WP.
+     */
+    public function actionFooterLinks(): Response
+    {
+        $this->requireDeonKey();
+        $table = '{{%deonai_seo_hygiene}}';
+        $existing = (new \craft\db\Query())->from($table)->where(['type' => 'footer_links'])->one();
+        $current = $existing ? (json_decode((string)$existing['content'], true) ?: []) : [];
+
+        if (Craft::$app->getRequest()->getIsGet()) {
+            return $this->asJson($current ?: ['heading' => '', 'links' => []]);
+        }
+
+        if ($response = $this->checkPermission('nav_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $merge = !empty($body['merge']);
+        $heading = trim((string)($body['heading'] ?? ''));
+        $in = is_array($body['links'] ?? null) ? $body['links'] : [];
+        $links = [];
+        if ($merge && !empty($current['links']) && is_array($current['links'])) {
+            foreach ($current['links'] as $l) {
+                if (is_array($l) && !empty($l['page_id'])) {
+                    $links[(int)$l['page_id']] = ['page_id' => (int)$l['page_id'], 'label' => (string)($l['label'] ?? '')];
+                }
+            }
+        }
+        foreach ($in as $l) {
+            if (!is_array($l)) {
+                continue;
+            }
+            $pid = (int)($l['page_id'] ?? $l['entry_id'] ?? 0);
+            $label = trim((string)($l['label'] ?? ''));
+            if ($pid > 0 && $label !== '' && Entry::find()->id($pid)->status(null)->exists()) {
+                $links[$pid] = ['page_id' => $pid, 'label' => $label];
+            }
+        }
+        $links = array_slice(array_values($links), 0, 20);
+        $data = [
+            'heading' => $heading !== '' ? $heading : (!empty($current['heading']) ? (string)$current['heading'] : 'Servicegebiete'),
+            'links' => $links,
+        ];
+
+        $db = Craft::$app->getDb();
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        $json = json_encode($data, JSON_UNESCAPED_UNICODE);
+        if ($existing) {
+            $db->createCommand()->update($table, ['content' => $json, 'dateUpdated' => $now], ['id' => $existing['id']])->execute();
+        } else {
+            $db->createCommand()->insert($table, [
+                'type' => 'footer_links', 'content' => $json,
+                'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+            ])->execute();
+        }
+
+        return $this->asJson(['success' => true, 'count' => count($links), 'heading' => $data['heading'], 'plugin_version' => Plugin::getInstance()->getVersion()]);
+    }
+
+    // ─── v0.8.0-Helfer ──────────────────────────────────────────────────────
+
+    /** Einheitliches Entry-Summary im WP-/pages-Shape. */
+    private function entrySummary(Entry $entry): array
+    {
+        return [
+            'id' => $entry->id,
+            'title' => $entry->title,
+            'slug' => $entry->slug,
+            'type' => $entry->getSection()?->handle ?? '',
+            'status' => $entry->getStatus(),
+            'link' => $entry->getUrl(),
+            'modified' => $entry->dateUpdated?->format('Y-m-d H:i:s'),
+        ];
+    }
+
+    /**
+     * Body-Feld eines Entries auflösen: expliziter Request-Param > Plugin-
+     * Setting > "deonBody"-Bootstrap-Feld. Gibt [handle|null, html] zurück —
+     * handle null, wenn keines der Felder am Entry existiert.
+     * @return array{0: ?string, 1: string}
+     */
+    private function resolveEntryBody(Entry $entry, ?string $explicitHandle = null): array
+    {
+        $settings = Plugin::getInstance()->getSettings();
+        $candidates = array_values(array_unique(array_filter([
+            $explicitHandle,
+            $settings->blogBodyFieldHandle,
+            self::DEON_BODY_FIELD_HANDLE,
+        ])));
+        foreach ($candidates as $handle) {
+            try {
+                $value = (string)$entry->getFieldValue($handle);
+                return [$handle, $value];
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+        return [null, ''];
+    }
+
+    /**
+     * Walkbare Text-Blöcke im Body-HTML — Contract identisch zum WP-Plugin
+     * (aideon_content_blocks, html-Modus): h1–h3 = "title", p = "editor",
+     * sortiert nach Position, IDs entstehen als "pc-<Index>".
+     * @return array<int, array{pos: int, full: string, inner: string, kind: string}>
+     */
+    private function contentBlocks(string $content): array
+    {
+        $specs = [
+            ['title', '/<h[1-3]\b[^>]*>(.*?)<\/h[1-3]>/is'],
+            ['editor', '/<p\b[^>]*>(.*?)<\/p>/is'],
+        ];
+        $found = [];
+        foreach ($specs as $spec) {
+            if (preg_match_all($spec[1], $content, $matches, PREG_OFFSET_CAPTURE)) {
+                $n = count($matches[0]);
+                for ($i = 0; $i < $n; $i++) {
+                    $found[] = [
+                        'pos' => (int)$matches[0][$i][1],
+                        'full' => (string)$matches[0][$i][0],
+                        'inner' => (string)$matches[1][$i][0],
+                        'kind' => $spec[0],
+                    ];
+                }
+            }
+        }
+        usort($found, static fn(array $a, array $b) => $a['pos'] - $b['pos']);
+        return $found;
+    }
+
+    /**
+     * Preview-Token verifizieren — Format identisch zum WP-Plugin:
+     * base64url(hmac_sha256("<url>:<exp>", apiKey, raw)) . "." . exp.
+     */
+    private function verifyPreviewToken(string $token, string $url): bool
+    {
+        if ($token === '' || $url === '') {
+            return false;
+        }
+        $parts = explode('.', $token, 2);
+        if (count($parts) !== 2) {
+            return false;
+        }
+        [$sigB64, $exp] = $parts;
+        $exp = (int)$exp;
+        if ($exp < time() - 5 || $exp > time() + 600) {
+            return false;
+        }
+        $apiKey = Plugin::getInstance()->getSettings()->apiKey;
+        if (empty($apiKey)) {
+            return false;
+        }
+        $expected = hash_hmac('sha256', $url . ':' . $exp, $apiKey, true);
+        $expectedB64 = rtrim(strtr(base64_encode($expected), '+/', '-_'), '=');
+        return hash_equals($expectedB64, $sigB64);
+    }
+
+    /** Upsert einer SEO-Override-Zeile (nur nicht-null-Felder), fail-soft. */
+    private function upsertSeoOverrideRow(string $uri, array $fields): void
+    {
+        try {
+            $fields = array_filter($fields, static fn($v) => $v !== null);
+            if (empty($fields)) {
+                return;
+            }
+            $db = Craft::$app->getDb();
+            $table = '{{%deonai_seo_overrides}}';
+            $now = (new \DateTime())->format('Y-m-d H:i:s');
+            $existing = (new \craft\db\Query())->from($table)->where(['uri' => $uri])->one();
+            if ($existing) {
+                $db->createCommand()->update($table, $fields + ['dateUpdated' => $now], ['id' => $existing['id']])->execute();
+            } else {
+                $db->createCommand()->insert($table, $fields + [
+                    'uri' => $uri, 'enabled' => true,
+                    'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+                ])->execute();
+            }
+        } catch (\Throwable $e) {
+            Craft::warning('deon-ai-connect seo override upsert failed: ' . $e->getMessage(), __METHOD__);
+        }
+    }
+
+    /**
+     * CSS der Startseite einsammeln: <style>-Blöcke + bis zu 3 Same-Origin-
+     * Stylesheets (je max. 300 KB). Fail-soft: leerer String bei Fehlern.
+     */
+    private function collectSiteCss(): string
+    {
+        try {
+            $baseUrl = (string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl();
+            if ($baseUrl === '') {
+                return '';
+            }
+            $client = Craft::createGuzzleClient(['timeout' => 15]);
+            $response = $client->request('GET', $baseUrl, ['http_errors' => false]);
+            if ($response->getStatusCode() >= 400) {
+                return '';
+            }
+            $html = (string)$response->getBody();
+            $css = '';
+
+            if (preg_match_all('/<style\b[^>]*>(.*?)<\/style>/is', $html, $matches)) {
+                $css .= implode("\n", $matches[1]);
+            }
+
+            $ownHost = preg_replace('/^www\./', '', strtolower((string)parse_url($baseUrl, PHP_URL_HOST)));
+            if (preg_match_all('/<link\b[^>]*rel=("|\')stylesheet\1[^>]*>/i', $html, $matches)) {
+                $fetched = 0;
+                foreach ($matches[0] as $tag) {
+                    if ($fetched >= 3 || !preg_match('/href=("|\')([^"\']+)\1/i', $tag, $href)) {
+                        continue;
+                    }
+                    $cssUrl = html_entity_decode($href[2]);
+                    if (str_starts_with($cssUrl, '//')) {
+                        $cssUrl = 'https:' . $cssUrl;
+                    } elseif (str_starts_with($cssUrl, '/')) {
+                        $cssUrl = rtrim($baseUrl, '/') . $cssUrl;
+                    }
+                    $cssHost = preg_replace('/^www\./', '', strtolower((string)parse_url($cssUrl, PHP_URL_HOST)));
+                    if ($cssHost !== $ownHost) {
+                        continue;
+                    }
+                    try {
+                        $cssResponse = $client->request('GET', $cssUrl, ['http_errors' => false]);
+                        if ($cssResponse->getStatusCode() < 400) {
+                            $body = (string)$cssResponse->getBody();
+                            if (strlen($body) <= 300 * 1024) {
+                                $css .= "\n" . $body;
+                                $fetched++;
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        continue;
+                    }
+                }
+            }
+            return $css;
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
     /** Sichert Inhalt fail-soft vor einer destruktiven /files- oder /faq-Änderung. */
     private function backupContent(string $ref, string $content): void
     {
@@ -1177,6 +2037,9 @@ TWIG;
         $rows = (new \craft\db\Query())
             ->select(['type', 'content', 'dateUpdated'])
             ->from('{{%deonai_seo_hygiene}}')
+            // Nur echte Hygiene-Typen — die Tabelle speichert seit v0.8.0 auch
+            // site_schema/footer_links, die hier nichts verloren haben.
+            ->where(['type' => ['robots', 'llms']])
             ->all();
         return $this->asJson(['ok' => true, 'items' => $rows]);
     }
