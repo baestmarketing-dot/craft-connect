@@ -12,6 +12,8 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **Native Content-Bausteine** — FAQ-Blöcke idempotent in bestehende Entries einbauen (`/deon-ai/faq`), Standort-/Faktenseiten als eigene Section anlegen (`/deon-ai/page`, Setting `pagesSectionHandle`), robots.txt/llms.txt direkt im Webroot lesen/schreiben (`/deon-ai/files`) — jeweils mit Backup vor dem Überschreiben.
 - **Berechtigungen** — der Kunde entscheidet im Control Panel selbst, was Deon AI ändern darf. Nicht freigegebene 1-Klick-Fixes werden im Deon-AI-Dashboard ausgegraut statt einen Fehler zu werfen.
 - **Remote-Self-Update** — Deon AI kann das Plugin bei neuen Versionen selbstständig per Composer aktualisieren, ohne dass jemand ins Control Panel muss. Craft spielt Plugin-Updates sonst nie automatisch ein.
+- **Blog-/Seiten-Bootstrap** — legt bei Bedarf Body-/Bildfeld und Blog-/Seiten-Section selbst an (`/deon-ai/setup-blog`), damit das Publishing auch auf einer frischen Craft-Installation ohne bestehendes Content-Schema funktioniert.
+- **Navigation** — verlinkt generierte Seiten automatisch in Hauptnavigation oder Footer (`/deon-ai/nav`), wenn das kostenlose Plugin [verbb/navigation](https://plugins.craftcms.com/navigation) installiert ist.
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -54,6 +56,9 @@ Unter **Einstellungen → Plugins → Deon AI Connect → Berechtigungen** legt 
 | robots.txt / llms.txt (`allowFiles`) | aus | `/deon-ai/files`, `/deon-ai/hygiene` |
 | Bild-Uploads (`allowAssets`) | aus | `/deon-ai/asset` |
 | Plugin automatisch aktualisieren (`allowSelfUpdate`) | an | `/deon-ai/self-update` |
+| Navigation bearbeiten (`allowNavEdit`) | aus | `/deon-ai/nav` |
+
+`/deon-ai/setup-blog` läuft unter derselben Berechtigung wie neue Seiten (`allowPageCreate`), da es im Kern ebenfalls Content-Struktur anlegt.
 
 Nur SEO-Overrides und Self-Update sind standardmäßig aktiv — SEO-Overrides, da sie rein serverseitig wirken und keinen Inhalt verändern; Self-Update, da Updates auch Sicherheitsfixes enthalten können. Ein Aufruf gegen einen nicht freigegebenen Endpoint liefert `403 { "ok": false, "error": "consent_required", "permission": "<key>" }`. `/deon-ai/ping` gibt den aktuellen Freigabe-Stand aller Kategorien im Feld `permissions` zurück, damit Deon AI nicht freigegebene 1-Klick-Fixes im Dashboard ausgrauen kann. Lese-Endpoints (`ping`, `seo-list`, `entries`, `hygiene-list`, `rollback/*`) sind bewusst nicht gegated — Rückgängig machen (Rollback) funktioniert unabhängig von diesen Schaltern immer.
 
@@ -73,6 +78,18 @@ php craft deon-ai-connect/update 0.6.1
 ```
 
 Gleicher Code-Pfad wie die REST-Endpoints (Composer-Swap + Migrationen in einem Lauf), nur ohne die Web-Request-Limits.
+
+## Blog-/Seiten-Bootstrap
+
+Auf einer frischen Craft-Installation ohne bestehendes Blog-Schema scheitert das Publishing an `section_not_found` oder fehlenden Feld-Handles. **`POST /deon-ai/setup-blog`** behebt das: legt bei Bedarf ein Body-Feld (`deonBody` — CKEditor, falls `craftcms/ckeditor` installiert ist, sonst Redactor, sonst ein mehrzeiliges Klartext-Feld), ein Featured-Image-Feld (`deonFeaturedImage`, auf das erste vorhandene Volume beschränkt) sowie die Sections `deonBlog` (Channel, `blog/{slug}`) und `deonPages` (Structure, `{slug}`) an. Idempotent: bereits vorhandene, gültige Handles werden nie überschrieben, nur leere oder kaputte Plugin-Settings automatisch mit den neuen Handles verdrahtet. Fehlt ein Volume, wird das Bildfeld übersprungen (`featured_image: "no_volume"`) — das Plugin legt nie selbst ein Volume/Filesystem an, das ist hosting-abhängig. Fehlt einer Section noch ein Template, meldet die Antwort `template_missing` und liefert ein minimales Beispiel-Template als String mit (wird nicht selbst ins `templates/`-Verzeichnis geschrieben).
+
+## Navigation
+
+**`POST /deon-ai/nav`** (`{ target: "main"|"footer", url, title, entry_id? }`) verlinkt eine generierte Seite in Hauptnavigation oder Footer. Craft hat keine Kern-Navigation, daher eine Strategie-Kaskade:
+
+1. Ist [verbb/navigation](https://plugins.craftcms.com/navigation) installiert (der De-facto-Standard für Craft-Navigationen), wählt das Plugin die passende Nav per Handle-/Namens-Heuristik (`main`/`haupt`/`primary` bzw. `footer`/`fuss`, sonst die erste vorhandene Nav) und legt einen Node an — dedupliziert über die Ziel-URL bzw. den verlinkten Entry. Antwort: `{ ok, via: "verbb", nav: { handle } }`.
+2. Sonst, falls eine Structure-Section mit Handle `nav`/`menu` existiert **und** deren Entry-Type ein Feld `linkUrl` oder `url` hat, wird dort ein Entry angelegt. Ohne ein eindeutiges Link-Feld wird nicht geraten.
+3. Sonst `422 { ok: false, error: "nav_not_automatable", hint: "…" }` mit dem Hinweis, den Link manuell im CP/Template zu setzen — und dem Tipp, dass Deon AI die Navigation mit dem kostenlosen verbb-Plugin automatisch pflegen kann.
 
 ## Änderungsprotokoll & Rollback
 

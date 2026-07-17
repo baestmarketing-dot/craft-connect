@@ -74,6 +74,8 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/ping'] = 'deon-ai-connect/api/ping';
                 $event->rules['deon-ai/self-update'] = 'deon-ai-connect/api/self-update';
                 $event->rules['deon-ai/up'] = 'deon-ai-connect/api/up';
+                $event->rules['deon-ai/setup-blog'] = 'deon-ai-connect/api/setup-blog';
+                $event->rules['deon-ai/nav'] = 'deon-ai-connect/api/nav';
                 $event->rules['deon-ai/seo'] = 'deon-ai-connect/api/set-seo';
                 $event->rules['deon-ai/seo-list'] = 'deon-ai-connect/api/list-seo';
                 $event->rules['deon-ai/entry'] = 'deon-ai-connect/api/upsert-entry';
@@ -128,6 +130,25 @@ class Plugin extends BasePlugin
         return Craft::$app->getView()->renderTemplate('deon-ai-connect/settings', [
             'settings' => $this->getSettings(),
         ]);
+    }
+
+    /**
+     * Speichert einen Teil-Satz an Settings-Änderungen (z. B. aus
+     * ApiController::actionSetupBlog()), ohne EVENT_AFTER_SAVE_PLUGIN_SETTINGS
+     * erneut einen Bootstrap-Call auszulösen. Merged IMMER mit den
+     * bestehenden Settings (siehe v0.4.1-Fix: savePluginSettings() merged
+     * selbst NICHT — ein Teil-Array würde alle anderen Felder zurücksetzen).
+     */
+    public function saveSettingsWithoutBootstrap(array $updates): bool
+    {
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        self::$bootstrapping = true;
+        try {
+            return Craft::$app->getPlugins()->savePluginSettings($this, array_merge($settings->getAttributes(), $updates));
+        } finally {
+            self::$bootstrapping = false;
+        }
     }
 
     // ─── Ein-Key-Bootstrap ──────────────────────────────────────────────────
