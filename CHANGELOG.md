@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0 - 2026-07-17
+
+### Added
+- `POST /deon-ai/setup-blog` — Blog-/Seiten-Bootstrap für Pilotinnen ohne bestehendes Schema: legt bei Bedarf ein Body-Feld (`deonBody`, CKEditor falls installiert → Redactor falls installiert → PlainText multiline), ein Featured-Image-Feld (`deonFeaturedImage`, auf das erste vorhandene Volume beschränkt, wird übersprungen statt ein Volume zu erfinden) sowie die Sections `deonBlog` (Channel, `blog/{slug}`) und `deonPages` (Structure, `{slug}`) an — jeweils idempotent, bestehende Handles werden nie überschrieben. Verdrahtet leere/ungültige Plugin-Settings automatisch mit den neuen Handles. Meldet fehlende Section-Templates statt sie selbst anzulegen (liefert stattdessen ein Beispiel-Template im Response mit).
+- `/deon-ai/entry` und `/deon-ai/page` unterstützen jetzt beide `image_url`/`asset_id` fürs Featured Image (bisher nur `/entry`) — fail-soft, ein Bildfehler blockiert den Entry/die Seite nie.
+- `/deon-ai/ping` liefert zusätzlich `fields_ok: { body, featured_image }` (echte Feld-Existenz, nicht nur ob das Setting gesetzt ist) sowie `nav: { verbb, editable }`.
+- `POST /deon-ai/nav` (DEO-80) — verlinkt eine generierte Seite in Hauptnavigation oder Footer. Neuer Consent-Schalter `allowNavEdit` (Standard aus). Strategie-Kaskade, da Craft keine Kern-Navigation hat: (1) [verbb/navigation](https://plugins.craftcms.com/navigation), falls installiert — Nav per Handle/Name-Heuristik wählen, Node anlegen, Dedupe über URL/verlinkte Entry; (2) Structure-Section mit Handle `nav`/`menu` und einem `linkUrl`/`url`-Feld, falls vorhanden; (3) sonst `422 nav_not_automatable` mit Hinweis zur manuellen Verlinkung bzw. Tipp auf das verbb-Plugin.
+
 ## 0.6.0 - 2026-07-16
 
 ### Added

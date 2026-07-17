@@ -5,9 +5,17 @@ namespace deonai\craftconnect\controllers;
 use Craft;
 use craft\elements\Asset;
 use craft\elements\Entry;
+use craft\fields\Assets as AssetsField;
+use craft\fields\PlainText;
+use craft\fieldlayoutelements\CustomField;
 use craft\helpers\Assets as AssetsHelper;
 use craft\helpers\FileHelper;
 use craft\helpers\StringHelper;
+use craft\models\EntryType;
+use craft\models\FieldLayout;
+use craft\models\Section;
+use craft\models\Section_SiteSettings;
+use craft\models\Volume;
 use craft\web\Controller;
 use deonai\craftconnect\Plugin;
 use yii\web\ForbiddenHttpException;
@@ -40,6 +48,7 @@ class ApiController extends Controller
         'files' => 'allowFiles',
         'assets' => 'allowAssets',
         'self_update' => 'allowSelfUpdate',
+        'nav_edit' => 'allowNavEdit',
     ];
 
     /** Prüft eine Berechtigung; gibt bei fehlender Freigabe die fertige 403-Response zurück, sonst null. */
@@ -79,6 +88,16 @@ class ApiController extends Controller
                 'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
                 'pages' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->pagesSectionHandle ?: $settings->blogSectionHandle),
             ],
+            // Echte Handle-Existenz, nicht nur "ist das Setting nicht leer" —
+            // ein Setting kann auf einen längst gelöschten Feld-Handle zeigen.
+            'fields_ok' => [
+                'body' => (bool)Craft::$app->getFields()->getFieldByHandle($settings->blogBodyFieldHandle),
+                'featured_image' => !empty($settings->featuredImageFieldHandle) && (bool)Craft::$app->getFields()->getFieldByHandle($settings->featuredImageFieldHandle),
+            ],
+            'nav' => [
+                'verbb' => $this->isVerbbNavigationInstalled(),
+                'editable' => $this->isVerbbNavigationInstalled() && (bool)$settings->allowNavEdit,
+            ],
             'permissions' => [
                 'seo_meta' => (bool)$settings->allowSeoMeta,
                 'content_edit' => (bool)$settings->allowContentEdit,
@@ -86,6 +105,7 @@ class ApiController extends Controller
                 'files' => (bool)$settings->allowFiles,
                 'assets' => (bool)$settings->allowAssets,
                 'self_update' => (bool)$settings->allowSelfUpdate,
+                'nav_edit' => (bool)$settings->allowNavEdit,
             ],
         ]);
     }
@@ -651,6 +671,27 @@ class ApiController extends Controller
             ])->setStatusCode(422);
         }
 
+        // Featured Image (fail-soft: Volume/Feld nicht konfiguriert oder Upload
+        // fehlgeschlagen → Seite trotzdem ohne Bild speichern).
+        if (!empty($settings->featuredImageFieldHandle) && !empty($settings->assetVolumeHandle)) {
+            $assetId = null;
+            if (!empty($body['asset_id'])) {
+                $assetId = (int)$body['asset_id'];
+            } elseif (!empty($body['image_url'])) {
+                $bytes = $this->fetchUrlBytes((string)$body['image_url']);
+                if ($bytes !== null) {
+                    $assetId = $this->createAssetFromBytes($bytes, basename((string)$body['image_url']) ?: 'deon-ai-image.jpg', $settings->assetVolumeHandle);
+                }
+            }
+            if ($assetId) {
+                try {
+                    $entry->setFieldValue($settings->featuredImageFieldHandle, [$assetId]);
+                } catch (\Throwable $e) {
+                    // Feld-Handle falsch konfiguriert — Seite trotzdem speichern.
+                }
+            }
+        }
+
         if (!Craft::$app->getElements()->saveElement($entry)) {
             return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
         }
@@ -663,6 +704,407 @@ class ApiController extends Controller
             'section' => $sectionHandle,
             'status' => $entry->enabled ? 'live' : 'disabled',
         ]);
+    }
+
+    // ─── Feature 1: Blog-/Seiten-Bootstrap ─────────────────────────────────
+
+    private const DEON_BODY_FIELD_HANDLE = 'deonBody';
+    private const DEON_IMAGE_FIELD_HANDLE = 'deonFeaturedImage';
+    private const DEON_BLOG_SECTION_HANDLE = 'deonBlog';
+    private const DEON_PAGES_SECTION_HANDLE = 'deonPages';
+
+    /**
+     * POST /deon-ai/setup-blog — legt Blog-/Seiten-Section, Body- und
+     * Featured-Image-Feld an, falls sie fehlen, und verdrahtet die
+     * Plugin-Settings automatisch damit. Idempotent: bestehende, gültige
+     * Handles werden NIE angetastet — nur leere/kaputte Settings werden
+     * (um)geschrieben.
+     */
+    public function actionSetupBlog(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('page_create')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+
+        $fieldsService = Craft::$app->getFields();
+        $entriesService = Craft::$app->getEntries();
+        $result = [
+            'ok' => true,
+            'fields' => [],
+            'sections' => [],
+            'featured_image' => 'ok',
+            'template_missing' => [],
+        ];
+
+        // 1) Body-Feld
+        $bodyField = $fieldsService->getFieldByHandle(self::DEON_BODY_FIELD_HANDLE);
+        if ($bodyField) {
+            $result['fields']['body'] = 'existing';
+        } else {
+            $bodyField = $this->createDeonBodyField();
+            if (!$fieldsService->saveField($bodyField)) {
+                return $this->asJson(['ok' => false, 'error' => 'body_field_save_failed', 'details' => $bodyField->getErrors()])->setStatusCode(500);
+            }
+            $result['fields']['body'] = 'created';
+        }
+
+        // 2) Featured-Image-Feld — braucht ein Volume; niemals selbst eins anlegen
+        // (Filesystem/Storage ist hosting-abhängig), stattdessen überspringen.
+        $imageField = $fieldsService->getFieldByHandle(self::DEON_IMAGE_FIELD_HANDLE);
+        if ($imageField) {
+            $result['fields']['featured_image'] = 'existing';
+        } else {
+            $volume = Craft::$app->getVolumes()->getAllVolumes()[0] ?? null;
+            if (!$volume) {
+                $result['fields']['featured_image'] = 'skipped';
+                $result['featured_image'] = 'no_volume';
+            } else {
+                $imageField = $this->createDeonImageField($volume);
+                if (!$fieldsService->saveField($imageField)) {
+                    return $this->asJson(['ok' => false, 'error' => 'image_field_save_failed', 'details' => $imageField->getErrors()])->setStatusCode(500);
+                }
+                $result['fields']['featured_image'] = 'created';
+            }
+        }
+
+        // 3) Sections
+        $blogSection = $entriesService->getSectionByHandle(self::DEON_BLOG_SECTION_HANDLE);
+        if ($blogSection) {
+            $result['sections']['blog'] = 'existing';
+        } else {
+            $blogSection = $this->createDeonSection(self::DEON_BLOG_SECTION_HANDLE, 'Blog', Section::TYPE_CHANNEL, 'blog/{slug}', $bodyField, $imageField);
+            if (!$blogSection) {
+                return $this->asJson(['ok' => false, 'error' => 'blog_section_save_failed'])->setStatusCode(500);
+            }
+            $result['sections']['blog'] = 'created';
+        }
+        if (!$this->sectionHasTemplate($blogSection)) {
+            $result['template_missing'][] = 'blog';
+        }
+
+        $pagesSection = $entriesService->getSectionByHandle(self::DEON_PAGES_SECTION_HANDLE);
+        if ($pagesSection) {
+            $result['sections']['pages'] = 'existing';
+        } else {
+            $pagesSection = $this->createDeonSection(self::DEON_PAGES_SECTION_HANDLE, 'Seiten', Section::TYPE_STRUCTURE, '{slug}', $bodyField, $imageField);
+            if (!$pagesSection) {
+                return $this->asJson(['ok' => false, 'error' => 'pages_section_save_failed'])->setStatusCode(500);
+            }
+            $result['sections']['pages'] = 'created';
+        }
+        if (!$this->sectionHasTemplate($pagesSection)) {
+            $result['template_missing'][] = 'pages';
+        }
+
+        // 4) Settings auto-verdrahten — nur wenn leer oder auf einen längst
+        // ungültigen Handle zeigend; eine bestehende, funktionierende
+        // Konfiguration wird nie überschrieben.
+        $settings = Plugin::getInstance()->getSettings();
+        $updates = [];
+        if (empty($settings->blogSectionHandle) || !$entriesService->getSectionByHandle($settings->blogSectionHandle)) {
+            $updates['blogSectionHandle'] = self::DEON_BLOG_SECTION_HANDLE;
+        }
+        if (empty($settings->pagesSectionHandle) || !$entriesService->getSectionByHandle($settings->pagesSectionHandle)) {
+            $updates['pagesSectionHandle'] = self::DEON_PAGES_SECTION_HANDLE;
+        }
+        if (empty($settings->blogBodyFieldHandle) || !$fieldsService->getFieldByHandle($settings->blogBodyFieldHandle)) {
+            $updates['blogBodyFieldHandle'] = self::DEON_BODY_FIELD_HANDLE;
+        }
+        if ($imageField && (empty($settings->featuredImageFieldHandle) || !$fieldsService->getFieldByHandle($settings->featuredImageFieldHandle))) {
+            $updates['featuredImageFieldHandle'] = self::DEON_IMAGE_FIELD_HANDLE;
+        }
+        if (!empty($updates)) {
+            Plugin::getInstance()->saveSettingsWithoutBootstrap($updates);
+        }
+        $result['settings_updated'] = array_keys($updates);
+
+        if (!empty($result['template_missing'])) {
+            $result['sample_template'] = $this->sampleDeonTemplate();
+        }
+
+        return $this->asJson($result);
+    }
+
+    /** CKEditor, falls installiert, sonst Redactor, sonst PlainText (multiline) — in dieser Reihenfolge. */
+    private function createDeonBodyField(): \craft\base\FieldInterface
+    {
+        $fieldsService = Craft::$app->getFields();
+        if (Craft::$app->getPlugins()->getPlugin('ckeditor') !== null && class_exists('craft\\ckeditor\\Field')) {
+            $field = $fieldsService->createField('craft\\ckeditor\\Field');
+        } elseif (Craft::$app->getPlugins()->getPlugin('redactor') !== null && class_exists('craft\\redactor\\Field')) {
+            $field = $fieldsService->createField('craft\\redactor\\Field');
+        } else {
+            /** @var PlainText $field */
+            $field = $fieldsService->createField(PlainText::class);
+            $field->multiline = true;
+        }
+        $field->name = 'Deon Body';
+        $field->handle = self::DEON_BODY_FIELD_HANDLE;
+        return $field;
+    }
+
+    /** Assets-Feld, auf genau ein bestehendes Volume beschränkt (kein automatisches Volume-Anlegen — hosting-abhängig). */
+    private function createDeonImageField(Volume $volume): AssetsField
+    {
+        /** @var AssetsField $field */
+        $field = Craft::$app->getFields()->createField(AssetsField::class);
+        $field->name = 'Deon Featured Image';
+        $field->handle = self::DEON_IMAGE_FIELD_HANDLE;
+        $field->maxRelations = 1;
+        $field->restrictLocation = true;
+        $field->restrictedLocationSource = 'volume:' . $volume->uid;
+        $field->allowSubfolders = true;
+        return $field;
+    }
+
+    /** Legt eine Section (Channel oder Structure) samt Entry-Type + Field-Layout (Title + Body [+ Bild]) an. */
+    private function createDeonSection(string $handle, string $name, string $type, string $uriFormat, \craft\base\FieldInterface $bodyField, ?AssetsField $imageField): ?Section
+    {
+        $entryType = new EntryType();
+        $entryType->name = $name;
+        $entryType->handle = $handle;
+        $entryType->hasTitleField = true;
+
+        $elements = [new CustomField($bodyField)];
+        if ($imageField) {
+            $elements[] = new CustomField($imageField);
+        }
+        $fieldLayout = new FieldLayout(['type' => Entry::class]);
+        $fieldLayout->setTabs([
+            ['name' => 'Content', 'elements' => $elements],
+        ]);
+        $entryType->setFieldLayout($fieldLayout);
+
+        if (!Craft::$app->getEntries()->saveEntryType($entryType)) {
+            return null;
+        }
+
+        $siteSettings = [];
+        foreach (Craft::$app->getSites()->getAllSites() as $site) {
+            $siteSettings[] = new Section_SiteSettings([
+                'siteId' => $site->id,
+                'enabledByDefault' => true,
+                'hasUrls' => true,
+                'uriFormat' => $uriFormat,
+            ]);
+        }
+
+        $section = new Section();
+        $section->name = $name;
+        $section->handle = $handle;
+        $section->type = $type;
+        $section->setEntryTypes([$entryType]);
+        $section->setSiteSettings($siteSettings);
+
+        if (!Craft::$app->getEntries()->saveSection($section)) {
+            return null;
+        }
+        return $section;
+    }
+
+    private function sectionHasTemplate(Section $section): bool
+    {
+        foreach ($section->getSiteSettings() as $siteSettings) {
+            if (!empty($siteSettings->template)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Minimales Beispiel-Template als String im Response — wird NICHT selbst ins templates/-Verzeichnis geschrieben. */
+    private function sampleDeonTemplate(): string
+    {
+        return <<<'TWIG'
+{% extends "_layout" %}
+{% block content %}
+    <article>
+        <h1>{{ entry.title }}</h1>
+        {% if entry.deonFeaturedImage is defined and entry.deonFeaturedImage.one() %}
+            <img src="{{ entry.deonFeaturedImage.one().url }}" alt="{{ entry.title }}">
+        {% endif %}
+        <div>{{ entry.deonBody }}</div>
+    </article>
+{% endblock %}
+TWIG;
+    }
+
+    // ─── Feature 2: Navigation ──────────────────────────────────────────────
+
+    private function isVerbbNavigationInstalled(): bool
+    {
+        return Craft::$app->getPlugins()->getPlugin('navigation') !== null;
+    }
+
+    /**
+     * POST /deon-ai/nav — generierte Seite in Hauptnav oder Footer verlinken.
+     * Body: { target: "main"|"footer", url, title, entry_id? }
+     * Strategie-Kaskade, da Craft keine Kern-Navigation hat: verbb/navigation
+     * (De-facto-Standard) → Structure-Section mit linkUrl/url-Feld → 422 mit
+     * Hinweis zur manuellen Verlinkung (bzw. Upgrade-Tipp auf verbb).
+     */
+    public function actionNav(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('nav_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $target = (string)($body['target'] ?? '');
+        if (!in_array($target, ['main', 'footer'], true)) {
+            return $this->asJson(['ok' => false, 'error' => 'target must be "main" or "footer"'])->setStatusCode(400);
+        }
+        $url = trim((string)($body['url'] ?? ''));
+        $title = trim((string)($body['title'] ?? ''));
+        $entryId = !empty($body['entry_id']) ? (int)$body['entry_id'] : null;
+        if ($title === '' || ($url === '' && $entryId === null)) {
+            return $this->asJson(['ok' => false, 'error' => 'title + (url or entry_id) required'])->setStatusCode(400);
+        }
+
+        if ($this->isVerbbNavigationInstalled()) {
+            return $this->navViaVerbb($target, $url, $title, $entryId);
+        }
+
+        $structureResult = $this->navViaStructureSection($url, $title, $entryId);
+        if ($structureResult !== null) {
+            return $structureResult;
+        }
+
+        return $this->asJson([
+            'ok' => false,
+            'error' => 'nav_not_automatable',
+            'hint' => 'Navigation dieser Craft-Site wird im Template gepflegt — Link im CP/Template einfügen. Tipp: Mit dem kostenlosen Plugin "Navigation" (verbb) kann Deon die Navigation automatisch pflegen.',
+        ])->setStatusCode(422);
+    }
+
+    /**
+     * Navigation über das verbb/navigation-Plugin (De-facto-Standard). API
+     * gegen den echten Plugin-Quellcode (craft-4/craft-5-Branches) verifiziert.
+     */
+    private function navViaVerbb(string $target, string $url, string $title, ?int $entryId): Response
+    {
+        /** @var \verbb\navigation\Navigation $navigation */
+        $navigation = \verbb\navigation\Navigation::$plugin;
+        $navs = $navigation->getNavs()->getAllNavs();
+        if (empty($navs)) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'nav_not_found',
+                'hint' => 'Im Plugin "Navigation" ist noch keine Navigation angelegt.',
+            ])->setStatusCode(422);
+        }
+
+        $pattern = $target === 'main' ? '/main|haupt|primary/i' : '/footer|fuss/i';
+        $nav = null;
+        foreach ($navs as $candidate) {
+            if (preg_match($pattern, $candidate->handle) || preg_match($pattern, $candidate->name)) {
+                $nav = $candidate;
+                break;
+            }
+        }
+        $nav = $nav ?? $navs[0];
+
+        $entry = null;
+        if ($entryId !== null) {
+            $entry = Entry::find()->id($entryId)->status(null)->one();
+            if (!$entry) {
+                return $this->asJson(['ok' => false, 'error' => 'entry_not_found'])->setStatusCode(404);
+            }
+        }
+
+        $site = Craft::$app->getSites()->getPrimarySite();
+
+        // Dedupe über URL (bzw. verlinkte Entry) — kein zweiter Node fürs selbe Ziel.
+        $existingNodes = $navigation->getNodes()->getNodesForNav($nav->id, $site->id);
+        foreach ($existingNodes as $existing) {
+            $isSameTarget = $entry !== null
+                ? $existing->elementId === $entry->id
+                : $existing->getUrl() === $url;
+            if ($isSameTarget) {
+                return $this->asJson(['ok' => true, 'via' => 'verbb', 'nav' => ['handle' => $nav->handle], 'node_id' => $existing->id, 'deduped' => true]);
+            }
+        }
+
+        $node = new \verbb\navigation\elements\Node();
+        $node->navId = $nav->id;
+        $node->siteId = $site->id;
+        $node->title = $title;
+        if ($entry !== null) {
+            $node->type = Entry::class;
+            $node->elementId = $entry->id;
+            $node->setElement($entry);
+        } else {
+            $node->type = \verbb\navigation\nodetypes\CustomType::class;
+            $node->setUrl($url);
+        }
+
+        try {
+            $saved = Craft::$app->getElements()->saveElement($node);
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'nav_save_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+        if (!$saved) {
+            return $this->asJson(['ok' => false, 'error' => 'nav_save_failed', 'details' => $node->getErrors()])->setStatusCode(500);
+        }
+
+        return $this->asJson(['ok' => true, 'via' => 'verbb', 'nav' => ['handle' => $nav->handle], 'node_id' => $node->id]);
+    }
+
+    /**
+     * Fallback ohne verbb/navigation: manche Sites bauen ihre Nav aus einer
+     * Structure-Section mit Handle ~ /nav|menu/. Nur automatisierbar, wenn
+     * deren Entry-Type tatsächlich ein Feld "linkUrl" oder "url" hat — sonst
+     * NICHT raten (gibt null zurück, Aufrufer fällt auf 422 zurück).
+     */
+    private function navViaStructureSection(string $url, string $title, ?int $entryId): ?Response
+    {
+        $navSection = null;
+        foreach (Craft::$app->getEntries()->getAllSections() as $section) {
+            if ($section->type === Section::TYPE_STRUCTURE && preg_match('/nav|menu/i', $section->handle)) {
+                $navSection = $section;
+                break;
+            }
+        }
+        if (!$navSection) {
+            return null;
+        }
+
+        $entryTypes = $navSection->getEntryTypes();
+        if (empty($entryTypes)) {
+            return null;
+        }
+        $entryType = $entryTypes[0];
+        $linkFieldHandle = null;
+        foreach ($entryType->getFieldLayout()->getCustomFields() as $field) {
+            if (in_array($field->handle, ['linkUrl', 'url'], true)) {
+                $linkFieldHandle = $field->handle;
+                break;
+            }
+        }
+        if ($linkFieldHandle === null) {
+            return null;
+        }
+
+        $entry = new Entry();
+        $entry->sectionId = $navSection->id;
+        $entry->typeId = $entryType->id;
+        $entry->title = $title;
+        $entry->enabled = true;
+        try {
+            $entry->setFieldValue($linkFieldHandle, $url);
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if (!Craft::$app->getElements()->saveElement($entry)) {
+            return $this->asJson(['ok' => false, 'error' => 'nav_save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+        }
+
+        return $this->asJson(['ok' => true, 'via' => 'structure', 'section' => $navSection->handle, 'entry_id' => $entry->id]);
     }
 
     /** Sichert Inhalt fail-soft vor einer destruktiven /files- oder /faq-Änderung. */

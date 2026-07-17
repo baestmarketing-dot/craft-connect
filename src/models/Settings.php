@@ -74,11 +74,18 @@ class Settings extends Model
      */
     public bool $allowSelfUpdate = true;
 
+    /**
+     * Deon AI darf die Hauptnavigation/den Footer verlinken (/deon-ai/nav).
+     * Standard AUS — Navigation ist sensibel; Deon-seitig gibt es zusätzlich
+     * einen eigenen Site-Toggle.
+     */
+    public bool $allowNavEdit = false;
+
     public function defineRules(): array
     {
         return [
             [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'pagesSectionHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
-            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets', 'allowSelfUpdate'], 'boolean'],
+            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets', 'allowSelfUpdate', 'allowNavEdit'], 'boolean'],
         ];
     }
 }

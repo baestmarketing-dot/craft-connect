@@ -57,6 +57,12 @@
     id: 'allowSelfUpdate', name: 'allowSelfUpdate', on: settings.allowSelfUpdate,
 }) }}
 
+{{ forms.lightswitchField({
+    label: 'Navigation bearbeiten'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, generierte Seiten automatisch in Hauptnavigation oder Footer zu verlinken (/deon-ai/nav). Standardmäßig aus, da Navigation sensibel ist. Funktioniert nur, wenn diese Site das kostenlose Plugin "Navigation" (verbb) installiert hat — sonst schlägt Deon AI stattdessen eine manuelle Verlinkung vor.'|t('deon-ai-connect'),
+    id: 'allowNavEdit', name: 'allowNavEdit', on: settings.allowNavEdit,
+}) }}
+
 <hr>
 
 {{ forms.lightswitchField({
