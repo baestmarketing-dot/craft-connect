@@ -67,11 +67,18 @@ class Settings extends Model
     /** Bild-Uploads als Assets (/deon-ai/asset). */
     public bool $allowAssets = false;
 
+    /**
+     * Deon AI darf das Plugin per Composer auf eine neue Version anheben
+     * (/deon-ai/self-update, /deon-ai/up). Standard AN, da Updates
+     * sicherheitsrelevant sind — Kundin kann bei Bedarf im CP abschalten.
+     */
+    public bool $allowSelfUpdate = true;
+
     public function defineRules(): array
     {
         return [
             [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'pagesSectionHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
-            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets'], 'boolean'],
+            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets', 'allowSelfUpdate'], 'boolean'],
         ];
     }
 }
