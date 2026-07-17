@@ -75,11 +75,27 @@ class Install extends Migration
             $this->createIndex(null, '{{%deonai_content_backups}}', ['ref'], false);
         }
 
+        if (!$this->db->tableExists('{{%deonai_landing_pages}}')) {
+            $this->createTable('{{%deonai_landing_pages}}', [
+                'id' => $this->primaryKey(),
+                'slug' => $this->string(200)->notNull(),
+                'title' => $this->string(255)->notNull(),
+                'html' => $this->longText()->notNull(),
+                'chrome' => $this->string(10)->defaultValue('full')->notNull(),
+                'enabled' => $this->boolean()->defaultValue(false)->notNull(),
+                'dateCreated' => $this->dateTime()->notNull(),
+                'dateUpdated' => $this->dateTime()->notNull(),
+                'uid' => $this->uid(),
+            ]);
+            $this->createIndex(null, '{{%deonai_landing_pages}}', ['slug'], true);
+        }
+
         return true;
     }
 
     public function safeDown(): bool
     {
+        $this->dropTableIfExists('{{%deonai_landing_pages}}');
         $this->dropTableIfExists('{{%deonai_content_backups}}');
         $this->dropTableIfExists('{{%deonai_change_log}}');
         $this->dropTableIfExists('{{%deonai_seo_hygiene}}');

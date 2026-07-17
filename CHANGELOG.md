@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 - 2026-07-17
+
+### Added
+Seiten-Anbindung — Contract-Parität zum WordPress-Plugin aideon-connect (v3.67.0), damit Deon AI Craft-Seiten lesen, im Original-Design klonen und texturieren kann. Neue Endpoints (Response-Shapes bewusst identisch zu WP, damit der Worker 1:1 durchreichen kann):
+
+- `GET /deon-ai/match-url?url=` — Entry per URL finden (inkl. Slug-Fallback)
+- `GET /deon-ai/pages` — Entries aller Sections, nach Änderungsdatum (ergänzt `/entries`, das nur eine Section pro Aufruf listet)
+- `GET /deon-ai/page-structure/<id>` — kompletter Seiteninhalt: Titel, Slug, Body-HTML, SEO-Override, plus walkbare Text-Blöcke (`content_blocks` mit `pc-N`-IDs: h1–h3 = `title`, p = `editor` — identisch zum builder-agnostischen WP-Contract)
+- `POST /deon-ai/set-widget-texts` — gezielte Text-Sets per `pc-N` auf den Entry-Body (SEO-Texturierung geklonter Standortseiten), mit Rollback-Protokoll
+- `POST /deon-ai/duplicate-page` — 1:1-Seiten-Klon mit find/replace-Textaustausch, `h1_override`, SEO-Metas, idempotent per `page_id` (der Standortseiten-Pfad im Original-Design)
+- `GET /deon-ai/render-preview` — gerendertes Frontend-HTML für die Dashboard-Preview; HMAC-Preview-Token (gleiches Format wie WP: 60s TTL) + Same-Origin-Guard
+- `POST /deon-ai/publish-lp` — Full-Page-Landingpage aus Roh-HTML (inkl. `<style>`/`<script>`), neue Tabelle `deonai_landing_pages`, ausgeliefert über eigene Route pro Slug, idempotent per `page_id`/Slug
+- `GET /deon-ai/theme-tokens` — Design-Tokens (Farben, Fonts, Radius, Palette). Craft hat kein theme.json, daher CSS-Extraktion aus der gerenderten Startseite inkl. einstufiger `var(--x)`-Auflösung (`source: "css_extract"`)
+- `POST /deon-ai/site-schema` — Site-weites JSON-LD (Organization/LocalBusiness), ausgespielt im `<head>` aller Seiten
+- `GET /deon-ai/sitemap-discover` — Sitemap-URL-Kandidaten
+- `GET|POST /deon-ai/footer-links` — Plugin-eigener Footer-Block („Servicegebiete") vor `</body>`, Markup identisch zum WP-Pendant
+- `/deon-ai/ping` liefert jetzt eine `capabilities`-Liste (Namensschema wie WP `/capabilities`) für einheitliches Feature-Gating im Worker
+
+### Changed
+- `/deon-ai/hygiene-list` liefert nur noch die Typen `robots`/`llms` (die Tabelle speichert jetzt zusätzlich `site_schema`/`footer_links`)
+
 ## 0.7.0 - 2026-07-17
 
 ### Added
