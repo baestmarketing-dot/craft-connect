@@ -15,6 +15,7 @@ Verbindet deine Craft-Site mit dem [Deon AI Marketing-OS](https://deon-ai.de): S
 - **Blog-/Seiten-Bootstrap** — legt bei Bedarf Body-/Bildfeld und Blog-/Seiten-Section selbst an (`/deon-ai/setup-blog`), damit das Publishing auch auf einer frischen Craft-Installation ohne bestehendes Content-Schema funktioniert.
 - **Navigation** — verlinkt generierte Seiten automatisch in Hauptnavigation oder Footer (`/deon-ai/nav`), wenn das kostenlose Plugin [verbb/navigation](https://plugins.craftcms.com/navigation) installiert ist. Zusätzlich ein Plugin-eigener Footer-Block („Servicegebiete", `/deon-ai/footer-links`), der ohne Zusatz-Plugin funktioniert.
 - **Seiten-Anbindung** — Deon AI kann Craft-Seiten vollständig lesen (`/deon-ai/page-structure`), per URL finden (`/deon-ai/match-url`), im Original-Design klonen und texturieren (`/deon-ai/duplicate-page`, `/deon-ai/set-widget-texts`), als Full-Page-Landingpage publizieren (`/deon-ai/publish-lp`) und die Design-Tokens der Site extrahieren (`/deon-ai/theme-tokens`) — Contract-Parität zum WordPress-Plugin, gleiche Response-Shapes.
+- **Section-Tests & A/B-Varianten** — komplette Seiten-Varianten mit Server-Cookie-Split (`/deon-ai/section-test/*`, Winner-Merge mit Rollback) sowie Selector-basierte A/B-Änderungen per Frontend-Snippet (`/deon-ai/ab-variant/*`), inkl. Remote-Konfiguration (`/deon-ai/configure-ab`, `/deon-ai/configure-tracker`).
 
 ## Voraussetzungen — vor der Installation prüfen
 
@@ -106,6 +107,18 @@ Damit Deon AI Craft-Seiten analysieren, im Original-Design klonen und texturiere
 - `GET /deon-ai/theme-tokens` — Farben/Fonts/Radius/Palette der Site. Craft hat kein theme.json wie WordPress-Block-Themes, deshalb extrahiert das Plugin die Tokens aus dem CSS der gerenderten Startseite (`<style>`-Blöcke + Same-Origin-Stylesheets, `var(--x)` wird eine Ebene aufgelöst) — `source: "css_extract"`, best-effort; der Worker-Normalizer wählt aus der Palette notfalls selbst.
 - `POST /deon-ai/site-schema` — Site-weites JSON-LD, ausgespielt im `<head>` aller Seiten. Berechtigung: `allowSeoMeta`.
 - `GET|POST /deon-ai/footer-links` — Plugin-eigener Footer-Block („Servicegebiete"-Links), gerendert vor `</body>`, ohne Zusatz-Plugin. Berechtigung (POST): `allowNavEdit`.
+
+## Section-Tests & A/B-Varianten
+
+Craft-natives Pendant zur Test-Engine des WordPress-Plugins. WP manipuliert dort Gutenberg-Blocks/Elementor-JSON — in Craft sind die „Sections" die **Top-Level-Elemente des Body-HTML** (builder `html`, Selector = Index oder `tag[n]`, z. B. `section[1]`):
+
+- `POST /deon-ai/section-test/create` — `{ original_post_id, name?, sections_changes: [{action, selector?, position?, html?, target_selector?}] }`. Legt die Variante als geklonten, **deaktivierten** Entry an (fürs Frontend unsichtbar) und startet den Test. Berechtigung: `allowContentEdit`.
+- **Ausspielung**: server-seitiger 50/50-Split per Cookie `aideon_st_<id>` (30 Tage, für das SDK lesbar — Conversion-Attribution wie bei WordPress). Bots (Googlebot & Co.) sehen immer das Original. Antworten werden mit `Cache-Control: no-store` + `Vary: Cookie` markiert, damit CDNs nicht eine Variante für alle einfrieren. Variante B ersetzt den Original-Body im gerenderten HTML — transformiert das Twig-Template den Feld-Inhalt so stark, dass er im HTML nicht wiedergefunden wird, wird fail-soft das Original ausgespielt (Warnung im Log).
+- `POST /deon-ai/section-test/preview` — wendet die Änderungen an, ohne zu speichern. `GET /deon-ai/section-test/list/<id>` — Tests inkl. Besucher-Zählern.
+- `POST /deon-ai/section-test/stop` — `{ original_post_id, test_id, winner: "a"|"b"|"none" }`. Winner B wird mit Rollback-Snapshot ins Original gemerged; die Variante wandert in den Craft-Papierkorb.
+- `POST /deon-ai/publish-winner` — Änderungs-Liste direkt anwenden (`seo_meta`, `content_replace`, `html_section`), immer mit Rollback-Snapshot. Berechtigung: `allowContentEdit`.
+- `POST /deon-ai/ab-variant/create` — Selector-basierte A/B-Variante (Modi `text`/`html`/`attr`/`link`/`style`/`form`, `percentage` 1–99). Ausspielung über ein Frontend-Snippet (1:1 vom WP-Plugin portiert): Cookie `aideon_ab_assign`, Preview-Forcing per `?aideon_force=a|b|<id>:b` mit Banner, Impression-Tracking per `sendBeacon` an Deon AI.
+- `POST /deon-ai/configure-ab` / `GET /deon-ai/ab-status` und `POST /deon-ai/configure-tracker` / `GET /deon-ai/tracker-status` — Remote-Konfiguration. `tracker_enabled=false` schaltet die SDK-Injection zusätzlich zur CP-Einstellung ab.
 
 ## Änderungsprotokoll & Rollback
 

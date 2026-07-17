@@ -28,7 +28,7 @@ use yii\web\Response;
 
 class Plugin extends BasePlugin
 {
-    public string $schemaVersion = '1.4.0';
+    public string $schemaVersion = '1.5.0';
     public bool $hasCpSettings = true;
 
     private const BOOTSTRAP_URL = 'https://audit.deon-ai.de/api/plugin/craft/bootstrap';
@@ -88,6 +88,19 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/site-schema'] = 'deon-ai-connect/api/site-schema';
                 $event->rules['deon-ai/sitemap-discover'] = 'deon-ai-connect/api/sitemap-discover';
                 $event->rules['deon-ai/footer-links'] = 'deon-ai-connect/api/footer-links';
+                // v0.9.0 — Section-Tests + A/B-Varianten (Craft-natives Pendant zu WP)
+                $event->rules['deon-ai/section-test/create'] = 'deon-ai-connect/api/section-test-create';
+                $event->rules['deon-ai/section-test/list/<id:\d+>'] = 'deon-ai-connect/api/section-test-list';
+                $event->rules['deon-ai/section-test/stop'] = 'deon-ai-connect/api/section-test-stop';
+                $event->rules['deon-ai/section-test/preview'] = 'deon-ai-connect/api/section-test-preview';
+                $event->rules['deon-ai/publish-winner'] = 'deon-ai-connect/api/publish-winner';
+                $event->rules['deon-ai/ab-variant/create'] = 'deon-ai-connect/api/ab-variant-create';
+                $event->rules['deon-ai/ab-variant/list/<id:\d+>'] = 'deon-ai-connect/api/ab-variant-list';
+                $event->rules['deon-ai/ab-variant/stop'] = 'deon-ai-connect/api/ab-variant-stop';
+                $event->rules['deon-ai/configure-ab'] = 'deon-ai-connect/api/configure-ab';
+                $event->rules['deon-ai/ab-status'] = 'deon-ai-connect/api/ab-status';
+                $event->rules['deon-ai/configure-tracker'] = 'deon-ai-connect/api/configure-tracker';
+                $event->rules['deon-ai/tracker-status'] = 'deon-ai-connect/api/tracker-status';
 
                 // Full-Page-Landingpages (/deon-ai/publish-lp): eine Route pro
                 // aktivem Slug. Fail-soft: Tabelle existiert vor der Migration
@@ -294,8 +307,10 @@ class Plugin extends BasePlugin
                 }
             }
 
-            // 3) Deon SDK (Tracking, Conversions, A/B-Varianten)
-            if ($settings->injectSdk && !empty($settings->siteId)) {
+            // 3) Deon SDK (Tracking, Conversions, A/B-Varianten). Zusätzlich zum
+            // CP-Setting remote abschaltbar über /deon-ai/configure-tracker.
+            $trackerEnabled = (bool)($this->getJsonConfig('tracker_config')['enabled'] ?? true);
+            if ($settings->injectSdk && $trackerEnabled && !empty($settings->siteId)) {
                 $inject .= '<script src="https://audit.deon-ai.de/sdk.js" data-site-id="'
                     . htmlspecialchars($settings->siteId, ENT_QUOTES) . '"'
                     . (!empty($settings->sdkKey) ? ' data-key="' . htmlspecialchars($settings->sdkKey, ENT_QUOTES) . '"' : '')
@@ -316,6 +331,17 @@ class Plugin extends BasePlugin
                 $html = preg_replace('~</body>~i', $footerHtml . '</body>', $html, 1);
             }
 
+            // 6) Section-Test: läuft für den gerenderten Entry ein Test, sieht die
+            // Hälfte der Besucher (Server-Cookie-Split, 50/50) den Varianten-Body.
+            $html = $this->applySectionTestSplit($html, $response);
+
+            // 7) A/B-Varianten-Snippet: Selector-basierte Frontend-Änderungen,
+            // Cookie-Split im Browser (Port des WP-wp_head-Snippets).
+            $abSnippet = $this->renderAbVariantSnippet();
+            if ($abSnippet !== '' && stripos($html, '</head>') !== false) {
+                $html = preg_replace('~</head>~i', $abSnippet . '</head>', $html, 1);
+            }
+
             $response->data = $html;
         } catch (\Throwable $e) {
             // Fail-soft: das Plugin darf NIE die Seitenauslieferung brechen.
@@ -334,6 +360,280 @@ class Plugin extends BasePlugin
             return $row ?: null;
         } catch (\Throwable $e) {
             return null; // Tabelle fehlt (Migration nicht gelaufen) → kein Patch
+        }
+    }
+
+    /**
+     * JSON-Config-Zeile aus deonai_seo_hygiene lesen (type z. B. 'ab_config',
+     * 'tracker_config', 'footer_links'). Fail-soft: leeres Array bei Fehlern.
+     */
+    public function getJsonConfig(string $type): array
+    {
+        try {
+            $json = (new \craft\db\Query())
+                ->select(['content'])
+                ->from('{{%deonai_seo_hygiene}}')
+                ->where(['type' => $type])
+                ->scalar();
+            $data = $json ? json_decode((string)$json, true) : null;
+            return is_array($data) ? $data : [];
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /** Bot-UAs, die nie in einen A/B-/Section-Split fallen dürfen (Regex identisch zum WP-Plugin). */
+    private const BOT_UA_PATTERN = '/(googlebot|bingbot|baiduspider|yandexbot|duckduckbot|slurp|facebookexternalhit|twitterbot|linkedinbot|whatsapp|applebot|petalbot|ahrefsbot|semrushbot|mj12bot|dotbot)/i';
+
+    /**
+     * Server-seitiger Section-Test-Split (Craft-Pendant zum WP-template_redirect-
+     * Router): läuft für den gerenderten Entry ein Test, wird per Cookie
+     * "aideon_st_<id>" (Name identisch zu WP, damit SDK/Conversion-Attribution
+     * gleich funktioniert) 50/50 gewürfelt. Variante B = der Body der geklonten
+     * Varianten-Entry ersetzt den Original-Body im fertigen HTML.
+     */
+    private function applySectionTestSplit(string $html, Response $response): string
+    {
+        try {
+            $element = Craft::$app->getUrlManager()->getMatchedElement();
+            if (!$element instanceof \craft\elements\Entry || !$element->id) {
+                return $html;
+            }
+            $test = (new \craft\db\Query())
+                ->from('{{%deonai_section_tests}}')
+                ->where(['originalId' => $element->id, 'status' => 'running'])
+                ->orderBy(['dateCreated' => SORT_ASC])
+                ->one();
+            if (!$test) {
+                return $html;
+            }
+
+            // Bots ausschließen — kein Split, Original ausspielen
+            $ua = (string)(Craft::$app->getRequest()->getUserAgent() ?? '');
+            if (preg_match(self::BOT_UA_PATTERN, $ua)) {
+                return $html;
+            }
+
+            $cookieName = 'aideon_st_' . $element->id;
+            $bucket = (string)($_COOKIE[$cookieName] ?? '');
+            if ($bucket !== 'a' && $bucket !== 'b') {
+                $bucket = (random_int(0, 1) === 1) ? 'b' : 'a';
+                // Rohes setcookie() statt Yii-Response-Cookie: Yii würde den Wert
+                // signieren (Cookie-Validation) — dann käme beim nächsten Request
+                // ein Hash-Blob statt "a"/"b" an und der Split würde jedes Mal neu
+                // würfeln. httponly=false, damit das SDK den Bucket für die
+                // Conversion-Attribution lesen kann (identisch zum WP-Plugin).
+                setcookie($cookieName, $bucket, [
+                    'expires' => time() + 30 * 86400,
+                    'path' => '/',
+                    'samesite' => 'Lax',
+                    'secure' => Craft::$app->getRequest()->getIsSecureConnection(),
+                    'httponly' => false,
+                ]);
+                $_COOKIE[$cookieName] = $bucket;
+                Craft::$app->getDb()->createCommand()
+                    ->update('{{%deonai_section_tests}}', [
+                        ($bucket === 'b' ? 'visitorsB' : 'visitorsA') => new \yii\db\Expression(($bucket === 'b' ? '[[visitorsB]]' : '[[visitorsA]]') . ' + 1'),
+                    ], ['id' => $test['id']])->execute();
+            }
+
+            // Cache-Bypass, damit CDN/Proxies nicht eine Variante für alle einfrieren
+            $response->headers->set('Cache-Control', 'no-store');
+            $response->headers->add('Vary', 'Cookie');
+
+            if ($bucket !== 'b') {
+                return $html;
+            }
+
+            $variant = \craft\elements\Entry::find()->id((int)$test['variantId'])->status(null)->one();
+            if (!$variant) {
+                return $html;
+            }
+            [$originalBody, $variantBody] = [$this->entryBodyHtml($element), $this->entryBodyHtml($variant)];
+            $originalBody = trim($originalBody);
+            if ($originalBody === '' || trim($variantBody) === '') {
+                return $html;
+            }
+            $pos = strpos($html, $originalBody);
+            if ($pos === false) {
+                // Template transformiert den Feld-HTML (z. B. Filter) — Split nicht möglich, Original ausspielen.
+                Craft::warning('deon-ai-connect section-test: Original-Body im gerenderten HTML nicht gefunden (Entry ' . $element->id . ')', __METHOD__);
+                return $html;
+            }
+            return substr_replace($html, $variantBody, $pos, strlen($originalBody));
+        } catch (\Throwable $e) {
+            return $html;
+        }
+    }
+
+    /** Body-HTML eines Entries (Settings-Handle, Fallback "deonBody"), fail-soft leer. */
+    private function entryBodyHtml(\craft\elements\Entry $entry): string
+    {
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        foreach (array_unique(array_filter([$settings->blogBodyFieldHandle, 'deonBody'])) as $handle) {
+            try {
+                return (string)$entry->getFieldValue($handle);
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+        return '';
+    }
+
+    /**
+     * A/B-Varianten-Snippet für den gerenderten Entry — JS-Port des
+     * wp_head-Snippets aus dem WP-Plugin (Cookie "aideon_ab_assign",
+     * ?aideon_force=-Preview, sendBeacon-Tracking, Modi text/html/attr/
+     * link/style/form). Leerer String, wenn kein laufender Test existiert
+     * oder A/B via /deon-ai/configure-ab deaktiviert wurde.
+     */
+    private function renderAbVariantSnippet(): string
+    {
+        try {
+            $abConfig = $this->getJsonConfig('ab_config');
+            if (isset($abConfig['enabled']) && !$abConfig['enabled']) {
+                return '';
+            }
+            $element = Craft::$app->getUrlManager()->getMatchedElement();
+            if (!$element instanceof \craft\elements\Entry || !$element->id) {
+                return '';
+            }
+            $rows = (new \craft\db\Query())
+                ->from('{{%deonai_ab_variants}}')
+                ->where(['entryId' => $element->id, 'status' => 'running'])
+                ->all();
+            if (empty($rows)) {
+                return '';
+            }
+            $variants = [];
+            foreach ($rows as $row) {
+                $config = json_decode((string)$row['config'], true);
+                if (is_array($config)) {
+                    $variants[] = $config;
+                }
+            }
+            if (empty($variants)) {
+                return '';
+            }
+            $payload = json_encode($variants, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $postId = (int)$element->id;
+            $trackUrl = json_encode('https://audit.deon-ai.de/api/ab-track');
+
+            return <<<HTML
+<!-- Deon AI A/B-Variant Splitting (Craft-Port des WP-Snippets v3.8) -->
+<script>
+(function(){
+  var variants = $payload;
+  var COOKIE = "aideon_ab_assign";
+  function getCookie(n){var m=document.cookie.match(new RegExp("(?:^|; )"+n+"=([^;]*)"));return m?decodeURIComponent(m[1]):"";}
+  function setCookie(n,v,d){var e=new Date(Date.now()+d*864e5);document.cookie=n+"="+encodeURIComponent(v)+"; expires="+e.toUTCString()+"; path=/; SameSite=Lax";}
+  var qs = new URLSearchParams(window.location.search);
+  var forceParam = qs.get("aideon_force");
+  var forceBucket = null, forceVariantId = null;
+  if (forceParam) {
+    if (forceParam.indexOf(":") >= 0) { var parts = forceParam.split(":"); forceVariantId = parts[0]; forceBucket = parts[1]; }
+    else { forceBucket = forceParam; }
+  }
+  var assigned = getCookie(COOKIE);
+  var assignMap = {};
+  try { assignMap = assigned ? JSON.parse(assigned) : {}; } catch(_) { assignMap = {}; }
+  if (forceBucket) {
+    var banner = document.createElement("div");
+    banner.style.cssText = "position:fixed;bottom:16px;right:16px;z-index:2147483646;background:#0a0a0f;color:#c5f75e;padding:10px 16px;border-radius:10px;border:1px solid #c5f75e;font:600 13px system-ui;box-shadow:0 8px 24px rgba(0,0,0,0.4);";
+    banner.textContent = "🔬 Preview: Variant " + forceBucket.toUpperCase() + (forceVariantId ? " (" + forceVariantId + ")" : "");
+    if (document.body) document.body.appendChild(banner);
+    else document.addEventListener("DOMContentLoaded", function(){ document.body.appendChild(banner); });
+  }
+  variants.forEach(function(v){
+    if(!assignMap[v.id]) { assignMap[v.id] = (Math.random()*100 < (v.percentage||50)) ? "b" : "a"; }
+    var bucket = assignMap[v.id];
+    if (forceBucket && (!forceVariantId || forceVariantId === v.id)) { bucket = forceBucket; }
+    try {
+      navigator.sendBeacon($trackUrl, JSON.stringify({ variant_id: v.id, post_id: $postId, bucket: bucket, event: "impression" }));
+    } catch(e) {}
+    if (bucket === "b") {
+      var apply = function(){
+        try {
+          var els = v.selector ? document.querySelectorAll(v.selector) : [];
+          if (!els.length && v.find) {
+            var html = document.body.innerHTML;
+            if (html.indexOf(v.find) >= 0) document.body.innerHTML = html.split(v.find).join(v.replace || "");
+            return;
+          }
+          els.forEach(function(el){
+            if (v.mode === "html" && v.variant_b_html) {
+              el.innerHTML = v.variant_b_html;
+            } else if (v.mode === "text") {
+              if (v.find && v.replace) {
+                var t = el.innerHTML;
+                if (t.indexOf(v.find) >= 0) el.innerHTML = t.split(v.find).join(v.replace);
+              } else if (v.replace) { el.textContent = v.replace; }
+            } else if (v.mode === "attr" && v.attr && v.value) {
+              if (v.attr === "style") { el.style.backgroundImage = "url('" + v.value + "')"; }
+              else {
+                el.setAttribute(v.attr, v.value);
+                if (v.attr === "src" && v.alt) el.setAttribute("alt", v.alt);
+              }
+            } else if (v.mode === "link") {
+              var linkEl = el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button" ? el : el.querySelector("a, button") || el;
+              if (v.href) {
+                if (linkEl.tagName.toLowerCase() === "a") linkEl.setAttribute("href", v.href);
+                else linkEl.dataset.deonHref = v.href;
+              }
+              if (v.target) linkEl.setAttribute("target", v.target);
+              if (v.text) linkEl.textContent = v.text;
+            } else if (v.mode === "style") {
+              if (v.bg_color) el.style.setProperty("background-color", v.bg_color, "important");
+              if (v.color) el.style.setProperty("color", v.color, "important");
+              if (v.custom_css) {
+                v.custom_css.split(";").forEach(function(rule){
+                  var parts = rule.split(":");
+                  if (parts.length === 2) el.style.setProperty(parts[0].trim(), parts[1].trim(), "important");
+                });
+              }
+            } else if (v.mode === "form") {
+              var form = el.tagName.toLowerCase() === "form" ? el : el.closest("form") || el.querySelector("form") || el;
+              if (form.tagName.toLowerCase() === "form") {
+                if (v.form_action) form.setAttribute("action", v.form_action);
+                if (v.form_method) form.setAttribute("method", v.form_method);
+                if (v.submit_text) {
+                  var submits = form.querySelectorAll('button[type="submit"], input[type="submit"], button:not([type])');
+                  submits.forEach(function(s){
+                    if (s.tagName.toLowerCase() === "input") s.value = v.submit_text;
+                    else s.textContent = v.submit_text;
+                  });
+                }
+                if (Array.isArray(v.field_updates)) {
+                  v.field_updates.forEach(function(fu){
+                    var fields = form.querySelectorAll(fu.selector || ('[name="' + (fu.name||"") + '"]'));
+                    fields.forEach(function(f){
+                      if (fu.placeholder !== undefined) f.setAttribute("placeholder", fu.placeholder);
+                      if (fu.label !== undefined) { var lbl = form.querySelector('label[for="'+f.id+'"]'); if (lbl) lbl.textContent = fu.label; }
+                      if (fu.required !== undefined) { if (fu.required) f.setAttribute("required", "required"); else f.removeAttribute("required"); }
+                      if (fu.value !== undefined) f.value = fu.value;
+                      if (fu.type !== undefined && (f.tagName.toLowerCase() === "input")) f.setAttribute("type", fu.type);
+                    });
+                  });
+                }
+              }
+            } else if (v.find && v.replace) {
+              var t = el.innerHTML;
+              if (t.indexOf(v.find) >= 0) el.innerHTML = t.split(v.find).join(v.replace);
+            }
+          });
+        } catch(e){}
+      };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", apply);
+      else apply();
+    }
+  });
+  if (!forceBucket) setCookie(COOKIE, JSON.stringify(assignMap), 30);
+})();
+</script>
+HTML;
+        } catch (\Throwable $e) {
+            return '';
         }
     }
 
