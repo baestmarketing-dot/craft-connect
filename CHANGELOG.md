@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0 - 2026-07-17
+
+### Added
+Section-Tests + A/B-Varianten — der letzte fehlende Funktionsblock aus dem WordPress-Plugin, Craft-nativ adaptiert (WP arbeitet auf Gutenberg-/Elementor-/Fusion-Strukturen; in Craft sind die „Sections" die Top-Level-Elemente des Body-HTML, builder `html`):
+
+- `POST /deon-ai/section-test/create` — Variante als geklonter, deaktivierter Entry (`duplicateElement`), Section-Änderungen (`insert`/`remove`/`move`/`replace`, Selector = Index oder `tag[n]`) per DOM-Engine auf den Body angewandt. Neue Tabelle `deonai_section_tests`.
+- Server-seitiger 50/50-Split beim Ausspielen: Cookie `aideon_st_<id>` (Name identisch zu WP, damit die SDK-Conversion-Attribution gleich funktioniert), Bot-Ausschluss, `Cache-Control: no-store` + `Vary: Cookie`, Besucher-Zähler. Variante B ersetzt den Original-Body im gerenderten HTML.
+- `GET /deon-ai/section-test/list/<id>`, `POST /deon-ai/section-test/preview` (anwenden ohne speichern), `POST /deon-ai/section-test/stop` — Winner B wird mit Rollback-Snapshot ins Original gemerged, die Variante wandert in den Craft-Papierkorb (weiches Löschen statt WP-Force-Delete).
+- `POST /deon-ai/publish-winner` — Änderungs-Liste anwenden: `seo_meta` → SEO-Override, `content_replace` → Body-Austausch, `html_section` → Section-Replace (Craft-Pendant zu `elementor_section`, das einen klaren Fehler meldet). Immer mit Rollback-Snapshot.
+- `POST /deon-ai/ab-variant/create`, `GET /deon-ai/ab-variant/list/<id>`, `POST /deon-ai/ab-variant/stop` — Selector-basierte A/B-Varianten (alle WP-Modi: `text`/`html`/`attr`/`link`/`style`/`form`), neue Tabelle `deonai_ab_variants`. Ausspielung über ein 1:1 portiertes Frontend-Snippet (Cookie `aideon_ab_assign`, `?aideon_force=`-Preview mit Banner, `sendBeacon`-Impression-Tracking).
+- `POST /deon-ai/configure-ab` + `GET /deon-ai/ab-status`, `POST /deon-ai/configure-tracker` + `GET /deon-ai/tracker-status` — Remote-Konfiguration (WP-Shapes); `tracker_enabled=false` schaltet zusätzlich zur CP-Einstellung die SDK-Injection ab.
+- `/deon-ai/ping`-`capabilities` um `content_replace`, `section_test`, `ab_variant_split`, `ab_script_inject`, `tracker_inject` erweitert.
+
 ## 0.8.0 - 2026-07-17
 
 ### Added

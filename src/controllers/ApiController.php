@@ -92,6 +92,8 @@ class ApiController extends Controller
                 'url_match', 'page_structure', 'render_preview', 'duplicate_page',
                 'widget_texts', 'publish_lp', 'theme_tokens', 'seo_schema',
                 'sitemap_discover', 'footer_links',
+                'content_replace', 'section_test', 'ab_variant_split',
+                'ab_script_inject', 'tracker_inject',
             ],
             'sections_ok' => [
                 'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
@@ -1965,6 +1967,712 @@ TWIG;
         } catch (\Throwable $e) {
             return '';
         }
+    }
+
+    // ─── v0.9.0: Section-Tests + A/B-Varianten (Craft-nativ) ────────────────
+
+    /**
+     * POST /deon-ai/section-test/create — Variante einer Seite anlegen und
+     * 50/50-Test starten. Body: { original_post_id, name?, sections_changes:
+     * [{action: insert|remove|move|replace, selector?, position?, html?,
+     * target_selector?}] } — Contract wie WP; "Sections" sind in Craft die
+     * Top-Level-Elemente des Body-HTML (builder "html"), Selector = Index
+     * oder "tag[n]" (z. B. "section[1]").
+     */
+    public function actionSectionTestCreate(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $originalId = (int)($body['original_post_id'] ?? 0);
+        if (!$originalId) {
+            return $this->asJson(['ok' => false, 'error' => 'original_post_id required'])->setStatusCode(400);
+        }
+        $original = Entry::find()->id($originalId)->status(null)->one();
+        if (!$original) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found', 'message' => 'Original-Post nicht gefunden'])->setStatusCode(404);
+        }
+        $name = trim((string)($body['name'] ?? 'Variant ' . date('Y-m-d H:i')));
+        $sectionsChanges = is_array($body['sections_changes'] ?? null) ? $body['sections_changes'] : [];
+
+        [$bodyHandle, $content] = $this->resolveEntryBody($original);
+        if ($bodyHandle === null) {
+            return $this->asJson(['ok' => false, 'error' => 'body_field_not_found'])->setStatusCode(422);
+        }
+
+        $applyResult = $this->applySectionChanges($content, $sectionsChanges);
+        if (isset($applyResult['error'])) {
+            return $this->asJson(['ok' => false, 'error' => $applyResult['error']])->setStatusCode(500);
+        }
+
+        try {
+            $variant = Craft::$app->getElements()->duplicateElement($original, [
+                'title' => mb_substr($original->title . ' [Deon-Variant]', 0, 255),
+                'enabled' => false, // versteckt fürs Frontend — ausgespielt wird sie nur über den Server-Split
+            ]);
+            $variant->slug = mb_substr($original->slug . '-deon-v', 0, 200);
+            $variant->setFieldValue($bodyHandle, $applyResult['content']);
+            if (!Craft::$app->getElements()->saveElement($variant)) {
+                return $this->asJson(['ok' => false, 'error' => 'clone_failed', 'details' => $variant->getErrors()])->setStatusCode(500);
+            }
+        } catch (\Throwable $e) {
+            return $this->asJson(['ok' => false, 'error' => 'clone_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+        }
+
+        $testId = 'st_' . substr(bin2hex(random_bytes(9)), 0, 12);
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        Craft::$app->getDb()->createCommand()->insert('{{%deonai_section_tests}}', [
+            'testId' => $testId,
+            'originalId' => $original->id,
+            'variantId' => $variant->id,
+            'name' => mb_substr($name, 0, 255),
+            'builder' => 'html',
+            'status' => 'running',
+            'sectionsChanges' => json_encode($sectionsChanges, JSON_UNESCAPED_UNICODE),
+            'warnings' => json_encode($applyResult['warnings'], JSON_UNESCAPED_UNICODE),
+            'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+        ])->execute();
+
+        return $this->asJson([
+            'success' => true,
+            'test_id' => $testId,
+            'variant_post_id' => $variant->id,
+            'variant_edit_url' => $variant->getCpEditUrl(),
+            'original_url' => $original->getUrl(),
+            'builder' => 'html',
+            'apply_warnings' => $applyResult['warnings'],
+            'cache_hint' => [],
+        ]);
+    }
+
+    /** GET /deon-ai/section-test/list/<id> — laufende/gestoppte Tests eines Entries (WP-Shape). */
+    public function actionSectionTestList(int $id): Response
+    {
+        $this->requireDeonKey();
+        $rows = (new \craft\db\Query())
+            ->from('{{%deonai_section_tests}}')
+            ->where(['originalId' => $id])
+            ->orderBy(['dateCreated' => SORT_DESC])
+            ->all();
+        $tests = array_map(static function (array $row) {
+            return [
+                'id' => $row['testId'],
+                'variant_post_id' => (int)$row['variantId'],
+                'name' => $row['name'],
+                'builder' => $row['builder'],
+                'status' => $row['status'],
+                'winner' => $row['winner'],
+                'started_at' => strtotime((string)$row['dateCreated']) ?: null,
+                'visitors_a' => (int)$row['visitorsA'],
+                'visitors_b' => (int)$row['visitorsB'],
+                'conversions_a' => (int)$row['conversionsA'],
+                'conversions_b' => (int)$row['conversionsB'],
+                'sections_changes' => json_decode((string)$row['sectionsChanges'], true) ?: [],
+                'apply_warnings' => json_decode((string)$row['warnings'], true) ?: [],
+            ];
+        }, $rows);
+        return $this->asJson(['tests' => $tests, 'cache_plugins_detected' => []]);
+    }
+
+    /**
+     * POST /deon-ai/section-test/stop — Test beenden. Body: { original_post_id,
+     * test_id, winner: "a"|"b"|"none" }. Winner "b" → Varianten-Body wird ins
+     * Original gemerged (mit Rollback-Snapshot davor). Die Varianten-Entry
+     * wandert in den Craft-Papierkorb (weiches Löschen statt WP-Force-Delete).
+     */
+    public function actionSectionTestStop(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $originalId = (int)($body['original_post_id'] ?? 0);
+        $testId = (string)($body['test_id'] ?? '');
+        $winner = in_array($body['winner'] ?? 'none', ['a', 'b', 'none'], true) ? (string)$body['winner'] : 'none';
+        if (!$originalId || $testId === '') {
+            return $this->asJson(['ok' => false, 'error' => 'original_post_id + test_id required'])->setStatusCode(400);
+        }
+        $test = (new \craft\db\Query())->from('{{%deonai_section_tests}}')->where(['testId' => $testId, 'originalId' => $originalId])->one();
+        if (!$test) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found', 'message' => 'Test nicht gefunden'])->setStatusCode(404);
+        }
+
+        $rollbackId = null;
+        if ($winner === 'b') {
+            $original = Entry::find()->id($originalId)->status(null)->one();
+            $variant = Entry::find()->id((int)$test['variantId'])->status(null)->one();
+            if ($original && $variant) {
+                [$bodyHandle, $originalBody] = $this->resolveEntryBody($original);
+                [, $variantBody] = $this->resolveEntryBody($variant);
+                if ($bodyHandle !== null) {
+                    $changeId = $this->logChange('entry', (string)$original->id, [
+                        'title' => $original->title, 'slug' => $original->slug, 'enabled' => $original->enabled,
+                        'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $originalBody,
+                    ], [
+                        'title' => $original->title, 'slug' => $original->slug, 'enabled' => $original->enabled,
+                        'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $variantBody,
+                    ], 'section-test/stop — Variante B gemerged (' . $testId . ')');
+                    $rollbackId = 'rb_' . $changeId;
+                    try {
+                        $original->setFieldValue($bodyHandle, $variantBody);
+                        if (!Craft::$app->getElements()->saveElement($original)) {
+                            return $this->asJson(['ok' => false, 'error' => 'merge_failed', 'details' => $original->getErrors()])->setStatusCode(500);
+                        }
+                    } catch (\Throwable $e) {
+                        return $this->asJson(['ok' => false, 'error' => 'merge_failed', 'message' => $e->getMessage()])->setStatusCode(500);
+                    }
+                }
+            }
+        }
+
+        // Varianten-Entry in den Papierkorb (fail-soft)
+        try {
+            $variant = Entry::find()->id((int)$test['variantId'])->status(null)->one();
+            if ($variant) {
+                Craft::$app->getElements()->deleteElement($variant);
+            }
+        } catch (\Throwable $e) {
+            Craft::warning('deon-ai-connect section-test: Varianten-Löschen fehlgeschlagen: ' . $e->getMessage(), __METHOD__);
+        }
+
+        Craft::$app->getDb()->createCommand()->update('{{%deonai_section_tests}}', [
+            'status' => 'stopped',
+            'winner' => $winner,
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['id' => $test['id']])->execute();
+
+        return $this->asJson([
+            'success' => true,
+            'winner' => $winner,
+            'merged_into_original' => ($winner === 'b'),
+            'rollback_id' => $rollbackId,
+            'rollback_available' => $rollbackId !== null,
+        ]);
+    }
+
+    /** POST /deon-ai/section-test/preview — Section-Changes anwenden ohne zu speichern (WP-Shape). */
+    public function actionSectionTestPreview(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $originalId = (int)($body['original_post_id'] ?? 0);
+        if (!$originalId) {
+            return $this->asJson(['ok' => false, 'error' => 'original_post_id required'])->setStatusCode(400);
+        }
+        $original = Entry::find()->id($originalId)->status(null)->one();
+        if (!$original) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found', 'message' => 'Original-Post nicht gefunden'])->setStatusCode(404);
+        }
+        $sectionsChanges = is_array($body['sections_changes'] ?? null) ? $body['sections_changes'] : [];
+        [, $content] = $this->resolveEntryBody($original);
+        $applyResult = $this->applySectionChanges($content, $sectionsChanges);
+        if (isset($applyResult['error'])) {
+            return $this->asJson(['ok' => false, 'error' => $applyResult['error']])->setStatusCode(500);
+        }
+        return $this->asJson([
+            'success' => true,
+            'builder' => 'html',
+            'preview_html' => $applyResult['content'],
+            'preview_content' => $applyResult['content'],
+            'warnings' => $applyResult['warnings'],
+        ]);
+    }
+
+    /**
+     * POST /deon-ai/publish-winner — Änderungs-Liste auf eine Seite anwenden
+     * (WP-Contract). changes[]-Typen: seo_meta {title, description} →
+     * SEO-Override; content_replace {find, replace} → Body-Austausch;
+     * html_section {selector, new_content} → Section-Replace (Craft-Pendant
+     * zu elementor_section — das selbst meldet einen Fehler, Elementor gibt
+     * es in Craft nicht).
+     */
+    public function actionPublishWinner(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $entryId = (int)($body['post_id'] ?? 0);
+        if (!$entryId) {
+            return $this->asJson(['ok' => false, 'error' => 'post_id required'])->setStatusCode(400);
+        }
+        $entry = Entry::find()->id($entryId)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+        $changes = is_array($body['changes'] ?? null) ? $body['changes'] : [];
+        $publishMode = (string)($body['publish_mode'] ?? 'draft');
+
+        [$bodyHandle, $content] = $this->resolveEntryBody($entry);
+        $beforeState = [
+            'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+            'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $content,
+        ];
+        $changeId = $this->logChange('entry', (string)$entry->id, $beforeState, $beforeState, 'publish-winner (Snapshot vor Merge)');
+        $rollbackId = 'rb_' . $changeId;
+
+        $applied = [];
+        $errors = [];
+        $bodyDirty = false;
+        $uri = '/' . ltrim((string)($entry->uri === '__home__' ? '' : $entry->uri), '/');
+
+        foreach ($changes as $change) {
+            $type = is_array($change) ? (string)($change['type'] ?? '') : '';
+            try {
+                switch ($type) {
+                    case 'seo_meta':
+                        $fields = [];
+                        if (isset($change['title'])) {
+                            $fields['title'] = mb_substr((string)$change['title'], 0, 200);
+                            $applied[] = 'seo_title';
+                        }
+                        if (isset($change['description'])) {
+                            $fields['metaDescription'] = mb_substr((string)$change['description'], 0, 300);
+                            $applied[] = 'seo_description';
+                        }
+                        if (!empty($fields)) {
+                            $this->upsertSeoOverrideRow($uri, $fields);
+                        }
+                        break;
+
+                    case 'content_replace':
+                        $find = (string)($change['find'] ?? '');
+                        if ($find !== '' && $bodyHandle !== null) {
+                            $newContent = str_replace($find, (string)($change['replace'] ?? ''), $content);
+                            if ($newContent !== $content) {
+                                $content = $newContent;
+                                $bodyDirty = true;
+                                $applied[] = 'content_replace';
+                            }
+                        }
+                        break;
+
+                    case 'html_section':
+                        $selector = $change['selector'] ?? null;
+                        $newContent = (string)($change['new_content'] ?? '');
+                        if ($selector !== null && $newContent !== '' && $bodyHandle !== null) {
+                            $result = $this->applySectionChanges($content, [[
+                                'action' => 'replace', 'selector' => $selector, 'html' => $newContent,
+                            ]]);
+                            if (!isset($result['error']) && $result['content'] !== $content) {
+                                $content = $result['content'];
+                                $bodyDirty = true;
+                                $applied[] = 'html_section_' . (is_scalar($selector) ? $selector : '?');
+                            }
+                        }
+                        break;
+
+                    case 'elementor_section':
+                        $errors[] = 'Elementor not available on Craft — use html_section';
+                        break;
+                }
+            } catch (\Throwable $e) {
+                $errors[] = $type . ': ' . $e->getMessage();
+            }
+        }
+
+        if ($publishMode === 'publish' && !empty($body['allow_direct_publish'])) {
+            $entry->enabled = true;
+            $applied[] = 'published';
+        }
+        if ($bodyDirty && $bodyHandle !== null) {
+            try {
+                $entry->setFieldValue($bodyHandle, $content);
+            } catch (\Throwable $e) {
+                $errors[] = 'body_write: ' . $e->getMessage();
+                $bodyDirty = false;
+            }
+        }
+        if (($bodyDirty || in_array('published', $applied, true)) && !Craft::$app->getElements()->saveElement($entry)) {
+            return $this->asJson(['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()])->setStatusCode(500);
+        }
+
+        // Nachher-Zustand in den Snapshot schreiben (Rollback stellt den Vorher-Stand wieder her)
+        Craft::$app->getDb()->createCommand()->update('{{%deonai_change_log}}', [
+            'afterJson' => json_encode([
+                'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+                'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $content,
+            ], JSON_UNESCAPED_UNICODE),
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['id' => $changeId])->execute();
+
+        return $this->asJson([
+            'success' => true,
+            'post_id' => $entry->id,
+            'applied' => $applied,
+            'errors' => $errors,
+            'rollback_id' => $rollbackId,
+            'rollback_available' => true,
+        ]);
+    }
+
+    /** Erlaubte A/B-Varianten-Modi (identisch zum WP-Plugin v3.9). */
+    private const AB_MODES = ['text', 'html', 'meta', 'attr', 'style', 'link', 'form'];
+
+    /**
+     * POST /deon-ai/ab-variant/create — Selector-basierte A/B-Variante anlegen
+     * (WP-Contract, alle Felder). Ausspielung über das Frontend-Snippet
+     * (siehe Plugin::renderAbVariantSnippet()).
+     */
+    public function actionAbVariantCreate(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $entryId = (int)($body['post_id'] ?? 0);
+        if (!$entryId || !Entry::find()->id($entryId)->status(null)->exists()) {
+            return $this->asJson(['ok' => false, 'error' => 'post_id required'])->setStatusCode(400);
+        }
+
+        $variantId = 'av_' . substr(bin2hex(random_bytes(8)), 0, 10);
+        $config = [
+            'id' => $variantId,
+            'name' => mb_substr(trim((string)($body['name'] ?? 'Variant B')), 0, 255),
+            'selector' => (string)($body['selector'] ?? ''),
+            'mode' => in_array($body['mode'] ?? 'text', self::AB_MODES, true) ? (string)$body['mode'] : 'text',
+            'find' => (string)($body['find'] ?? ''),
+            'replace' => (string)($body['replace'] ?? ''),
+            'variant_b_html' => (string)($body['variant_b_html'] ?? ''),
+            'attr' => (string)($body['attr'] ?? ''),
+            'value' => (string)($body['value'] ?? ''),
+            'alt' => (string)($body['alt'] ?? ''),
+            'href' => (string)($body['href'] ?? ''),
+            'target' => (string)($body['target'] ?? ''),
+            'text' => (string)($body['text'] ?? ''),
+            'bg_color' => (string)($body['bg_color'] ?? ''),
+            'color' => (string)($body['color'] ?? ''),
+            'custom_css' => (string)($body['custom_css'] ?? ''),
+            'form_action' => (string)($body['form_action'] ?? ''),
+            'form_method' => (string)($body['form_method'] ?? ''),
+            'submit_text' => (string)($body['submit_text'] ?? ''),
+            'field_updates' => is_array($body['field_updates'] ?? null) ? $body['field_updates'] : [],
+            'percentage' => max(1, min(99, (int)($body['percentage'] ?? 50))),
+            'created_at' => time(),
+            'visitors_a' => 0, 'visitors_b' => 0, 'conversions_a' => 0, 'conversions_b' => 0,
+            'status' => 'running',
+        ];
+
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        Craft::$app->getDb()->createCommand()->insert('{{%deonai_ab_variants}}', [
+            'variantId' => $variantId,
+            'entryId' => $entryId,
+            'config' => json_encode($config, JSON_UNESCAPED_UNICODE),
+            'status' => 'running',
+            'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+        ])->execute();
+
+        return $this->asJson([
+            'success' => true,
+            'variant_id' => $variantId,
+            'variant' => $config,
+            'frontend_snippet_active' => true,
+        ]);
+    }
+
+    /** GET /deon-ai/ab-variant/list/<id> — Varianten eines Entries (WP-Shape: keyed Object). */
+    public function actionAbVariantList(int $id): Response
+    {
+        $this->requireDeonKey();
+        $rows = (new \craft\db\Query())->from('{{%deonai_ab_variants}}')->where(['entryId' => $id])->all();
+        $variants = [];
+        foreach ($rows as $row) {
+            $config = json_decode((string)$row['config'], true) ?: [];
+            $config['status'] = $row['status'];
+            if ($row['winner'] !== null) {
+                $config['winner'] = $row['winner'];
+            }
+            $variants[$row['variantId']] = $config;
+        }
+        return $this->asJson(['variants' => $variants]);
+    }
+
+    /** POST /deon-ai/ab-variant/stop — Variante beenden. Body: { post_id, variant_id, winner? }. */
+    public function actionAbVariantStop(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $entryId = (int)($body['post_id'] ?? 0);
+        $variantId = (string)($body['variant_id'] ?? '');
+        $winner = in_array($body['winner'] ?? null, ['a', 'b'], true) ? (string)$body['winner'] : null;
+
+        $row = (new \craft\db\Query())->from('{{%deonai_ab_variants}}')->where(['variantId' => $variantId, 'entryId' => $entryId])->one();
+        if (!$row) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found', 'message' => 'Variant not found'])->setStatusCode(404);
+        }
+        $config = json_decode((string)$row['config'], true) ?: [];
+        $config['status'] = 'stopped';
+        $config['winner'] = $winner;
+        Craft::$app->getDb()->createCommand()->update('{{%deonai_ab_variants}}', [
+            'status' => 'stopped',
+            'winner' => $winner,
+            'config' => json_encode($config, JSON_UNESCAPED_UNICODE),
+            'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+        ], ['id' => $row['id']])->execute();
+
+        return $this->asJson(['success' => true]);
+    }
+
+    /** POST /deon-ai/configure-ab — A/B-Ausspielung remote konfigurieren (WP-Shape). */
+    public function actionConfigureAb(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $config = Plugin::getInstance()->getJsonConfig('ab_config');
+        if (isset($body['enabled'])) {
+            $config['enabled'] = (bool)$body['enabled'];
+        }
+        if (isset($body['anti_flicker'])) {
+            $config['anti_flicker'] = (bool)$body['anti_flicker'];
+        }
+        if (isset($body['store_id'])) {
+            $config['store_id'] = (string)$body['store_id'];
+        }
+        $this->saveJsonConfig('ab_config', $config);
+        return $this->asJson([
+            'success' => true,
+            'ab_enabled' => (bool)($config['enabled'] ?? true),
+            'anti_flicker' => (bool)($config['anti_flicker'] ?? false),
+            'store_id' => (string)($config['store_id'] ?? ''),
+        ]);
+    }
+
+    /** GET /deon-ai/ab-status — aktueller A/B-Konfigurationsstand (WP-Shape). */
+    public function actionAbStatus(): Response
+    {
+        $this->requireDeonKey();
+        $config = Plugin::getInstance()->getJsonConfig('ab_config');
+        return $this->asJson([
+            'ab_enabled' => (bool)($config['enabled'] ?? true),
+            'anti_flicker' => (bool)($config['anti_flicker'] ?? false),
+            'store_id' => (string)($config['store_id'] ?? ''),
+            'script_url' => 'https://audit.deon-ai.de/sdk.js',
+        ]);
+    }
+
+    /** POST /deon-ai/configure-tracker — SDK-/Tracker-Ausspielung remote konfigurieren (WP-Shape). */
+    public function actionConfigureTracker(): Response
+    {
+        $this->requireDeonKey();
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $config = Plugin::getInstance()->getJsonConfig('tracker_config');
+        if (isset($body['enabled'])) {
+            $config['enabled'] = (bool)$body['enabled'];
+        }
+        if (isset($body['consent_mode'])) {
+            $config['consent_mode'] = (string)$body['consent_mode'];
+        }
+        $this->saveJsonConfig('tracker_config', $config);
+        return $this->asJson([
+            'success' => true,
+            'tracker_enabled' => (bool)($config['enabled'] ?? true),
+            'consent_mode' => (string)($config['consent_mode'] ?? 'auto'),
+            'cmp_detected' => '',
+        ]);
+    }
+
+    /** GET /deon-ai/tracker-status — aktueller Tracker-Stand (WP-Shape). */
+    public function actionTrackerStatus(): Response
+    {
+        $this->requireDeonKey();
+        $config = Plugin::getInstance()->getJsonConfig('tracker_config');
+        return $this->asJson([
+            'tracker_enabled' => (bool)($config['enabled'] ?? true),
+            'consent_mode' => (string)($config['consent_mode'] ?? 'auto'),
+            'cmp_detected' => '',
+        ]);
+    }
+
+    /** JSON-Config-Zeile in deonai_seo_hygiene schreiben (Pendant zu Plugin::getJsonConfig()). */
+    private function saveJsonConfig(string $type, array $config): void
+    {
+        $db = Craft::$app->getDb();
+        $table = '{{%deonai_seo_hygiene}}';
+        $now = (new \DateTime())->format('Y-m-d H:i:s');
+        $json = json_encode($config, JSON_UNESCAPED_UNICODE);
+        $existing = (new \craft\db\Query())->from($table)->where(['type' => $type])->one();
+        if ($existing) {
+            $db->createCommand()->update($table, ['content' => $json, 'dateUpdated' => $now], ['id' => $existing['id']])->execute();
+        } else {
+            $db->createCommand()->insert($table, [
+                'type' => $type, 'content' => $json,
+                'dateCreated' => $now, 'dateUpdated' => $now, 'uid' => StringHelper::UUID(),
+            ])->execute();
+        }
+    }
+
+    /**
+     * Section-Engine (builder "html"): behandelt die Top-Level-Elemente des
+     * Body-HTML als Sections und wendet insert/remove/move/replace an.
+     * Selector: Integer-Index oder "tag[n]" (n-tes Vorkommen des Tags,
+     * 0-basiert; "tag" allein = erstes). Craft-natives Pendant zum
+     * DOM-Fallback des WP-Plugins, dort aber auf alle 4 Aktionen ausgebaut.
+     * @return array{content: string, warnings: array}|array{error: string}
+     */
+    private function applySectionChanges(string $content, array $sectionsChanges): array
+    {
+        $warnings = [];
+        if (empty($sectionsChanges)) {
+            return ['content' => $content, 'warnings' => ['no_changes_passed']];
+        }
+        if (!class_exists('DOMDocument')) {
+            return ['error' => 'no_dom'];
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $loaded = $dom->loadHTML('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>' . $content . '</body></html>');
+        libxml_clear_errors();
+        if (!$loaded) {
+            return ['error' => 'dom_load_failed'];
+        }
+        $domBody = $dom->getElementsByTagName('body')->item(0);
+        if (!$domBody) {
+            return ['error' => 'dom_load_failed'];
+        }
+
+        $topLevelElements = static function () use ($domBody): array {
+            $out = [];
+            foreach ($domBody->childNodes as $node) {
+                if ($node instanceof \DOMElement) {
+                    $out[] = $node;
+                }
+            }
+            return $out;
+        };
+        $resolveIndex = static function (array $sections, $selector): ?int {
+            if ($selector === null || $selector === '') {
+                return null;
+            }
+            if (is_int($selector) || (is_string($selector) && ctype_digit($selector))) {
+                $idx = (int)$selector;
+                return ($idx >= 0 && $idx < count($sections)) ? $idx : null;
+            }
+            if (is_string($selector) && preg_match('/^([a-z][a-z0-9]*)(?:\[(\d+)\])?$/i', $selector, $m)) {
+                $want = strtolower($m[1]);
+                $nth = isset($m[2]) ? (int)$m[2] : 0;
+                $count = 0;
+                foreach ($sections as $i => $node) {
+                    if (strtolower($node->tagName) === $want) {
+                        if ($count === $nth) {
+                            return $i;
+                        }
+                        $count++;
+                    }
+                }
+            }
+            return null;
+        };
+        $importFragment = static function (string $html) use ($dom): array {
+            $tmp = new \DOMDocument();
+            libxml_use_internal_errors(true);
+            $ok = $tmp->loadHTML('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>' . $html . '</body></html>');
+            libxml_clear_errors();
+            if (!$ok) {
+                return [];
+            }
+            $tmpBody = $tmp->getElementsByTagName('body')->item(0);
+            if (!$tmpBody) {
+                return [];
+            }
+            $nodes = [];
+            foreach ($tmpBody->childNodes as $node) {
+                $nodes[] = $dom->importNode($node, true);
+            }
+            return $nodes;
+        };
+        $insertNodes = static function (array $nodes, ?\DOMElement $ref, string $position) use ($domBody): void {
+            if ($ref === null) {
+                foreach ($nodes as $node) {
+                    $domBody->appendChild($node);
+                }
+                return;
+            }
+            if ($position === 'before') {
+                foreach ($nodes as $node) {
+                    $domBody->insertBefore($node, $ref);
+                }
+                return;
+            }
+            $next = $ref->nextSibling;
+            foreach ($nodes as $node) {
+                if ($next) {
+                    $domBody->insertBefore($node, $next);
+                } else {
+                    $domBody->appendChild($node);
+                }
+            }
+        };
+
+        foreach ($sectionsChanges as $change) {
+            if (!is_array($change)) {
+                continue;
+            }
+            $action = (string)($change['action'] ?? '');
+            $sections = $topLevelElements();
+            $idx = $resolveIndex($sections, $change['selector'] ?? null);
+            $position = (string)($change['position'] ?? 'after');
+
+            if ($action === 'insert') {
+                $nodes = !empty($change['html']) ? $importFragment((string)$change['html']) : [];
+                if (empty($nodes)) {
+                    $warnings[] = empty($change['html']) ? 'insert_skipped_no_payload' : 'fragment_invalid';
+                    continue;
+                }
+                $insertNodes($nodes, $idx !== null ? $sections[$idx] : null, $position);
+            } elseif ($action === 'remove') {
+                if ($idx !== null) {
+                    $domBody->removeChild($sections[$idx]);
+                } else {
+                    $warnings[] = 'remove_skipped';
+                }
+            } elseif ($action === 'move') {
+                $targetIdx = $resolveIndex($sections, $change['target_selector'] ?? null);
+                if ($idx === null || $targetIdx === null || $idx === $targetIdx) {
+                    $warnings[] = 'move_skipped';
+                    continue;
+                }
+                $moved = $domBody->removeChild($sections[$idx]);
+                $insertNodes([$moved], $sections[$targetIdx], $position);
+            } elseif ($action === 'replace') {
+                if ($idx === null) {
+                    $warnings[] = 'replace_skipped';
+                    continue;
+                }
+                $nodes = !empty($change['html']) ? $importFragment((string)$change['html']) : [];
+                if (empty($nodes)) {
+                    $warnings[] = 'replace_skipped_no_payload';
+                    continue;
+                }
+                $insertNodes($nodes, $sections[$idx], 'before');
+                $domBody->removeChild($sections[$idx]);
+            }
+        }
+
+        $newContent = '';
+        foreach ($domBody->childNodes as $child) {
+            $newContent .= $dom->saveHTML($child);
+        }
+        return ['content' => $newContent, 'warnings' => $warnings];
     }
 
     /** Sichert Inhalt fail-soft vor einer destruktiven /files- oder /faq-Änderung. */
