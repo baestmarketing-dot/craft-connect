@@ -107,6 +107,7 @@ Damit Deon AI Craft-Seiten analysieren, im Original-Design klonen und texturiere
 - `GET /deon-ai/theme-tokens` — Farben/Fonts/Radius/Palette der Site. Craft hat kein theme.json wie WordPress-Block-Themes, deshalb extrahiert das Plugin die Tokens aus dem CSS der gerenderten Startseite (`<style>`-Blöcke + Same-Origin-Stylesheets, `var(--x)` wird eine Ebene aufgelöst) — `source: "css_extract"`, best-effort; der Worker-Normalizer wählt aus der Palette notfalls selbst.
 - `POST /deon-ai/site-schema` — Site-weites JSON-LD, ausgespielt im `<head>` aller Seiten. Berechtigung: `allowSeoMeta`.
 - `GET|POST /deon-ai/footer-links` — Plugin-eigener Footer-Block („Servicegebiete"-Links), gerendert vor `</body>`, ohne Zusatz-Plugin. Berechtigung (POST): `allowNavEdit`.
+- `POST /deon-ai/audit-fix` — Content-Write-Fixes: `{ action: "replace_content"|"append_html_box", page_url, new_content?|custom_value?, payload?: { box_marker? } }`. `replace_content` ersetzt den kompletten Body (Freshness-Refresh), `append_html_box` hängt eine HTML-Box idempotent an (existiert ein `<aside>` mit der Marker-Klasse bereits, wird er ersetzt statt dupliziert — für interne Verlinkung/Pillar-Backrefs). Beide mit Rollback-Snapshot (`rollback_id`). Berechtigung: `allowContentEdit`.
 
 ## Section-Tests & A/B-Varianten
 

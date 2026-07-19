@@ -93,7 +93,7 @@ class ApiController extends Controller
                 'widget_texts', 'publish_lp', 'theme_tokens', 'seo_schema',
                 'sitemap_discover', 'footer_links',
                 'content_replace', 'section_test', 'ab_variant_split',
-                'ab_script_inject', 'tracker_inject',
+                'ab_script_inject', 'tracker_inject', 'audit_fix',
             ],
             'sections_ok' => [
                 'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
@@ -1967,6 +1967,120 @@ TWIG;
         } catch (\Throwable $e) {
             return '';
         }
+    }
+
+    // ─── v0.10.0: Content-Write-Fixes ───────────────────────────────────────
+
+    /**
+     * POST /deon-ai/audit-fix — Content-Write-Fixes vom Deon-AI-Worker
+     * (Freshness-Refresh, interne Verlinkung). Contract = WP /audit-fix,
+     * beschränkt auf die zwei Actions, die Craft braucht — alle anderen
+     * Fix-Actions (set_title/set_meta_desc/inject_faq/…) laufen bei Craft
+     * bereits über /deon-ai/seo bzw. /deon-ai/faq.
+     * Body: { action: "replace_content"|"append_html_box", page_url,
+     *         new_content?, custom_value?, payload?: { box_marker? } }
+     */
+    public function actionAuditFix(): Response
+    {
+        $this->requireDeonKey();
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+
+        $action = (string)($body['action'] ?? '');
+        if (!in_array($action, ['replace_content', 'append_html_box'], true)) {
+            return $this->asJson(['ok' => false, 'error' => 'unknown_action', 'message' => 'Unbekannte Fix-Action: ' . $action])->setStatusCode(400);
+        }
+
+        // Entry auflösen wie actionMatchUrl: Pfad → URI, Fallback letztes Slug-Segment
+        $pageUrl = trim((string)($body['page_url'] ?? ''));
+        $path = trim((string)(parse_url($pageUrl, PHP_URL_PATH) ?? ''), '/');
+        $entry = Entry::find()->uri($path === '' ? '__home__' : $path)->status(null)->one();
+        if (!$entry && $path !== '') {
+            $entry = Entry::find()->slug(basename($path))->status(null)->one();
+        }
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+
+        [$bodyHandle, $content] = $this->resolveEntryBody($entry);
+        if ($bodyHandle === null) {
+            return $this->asJson(['ok' => false, 'error' => 'body_field_not_found'])->setStatusCode(422);
+        }
+
+        // Snapshot VOR der Änderung — rollback_id ist Pflichtfeld der Response
+        $beforeState = [
+            'title' => $entry->title, 'slug' => $entry->slug, 'enabled' => $entry->enabled,
+            'bodyFieldHandle' => $bodyHandle, 'bodyValue' => $content,
+        ];
+        $changeId = $this->logChange('entry', (string)$entry->id, $beforeState, $beforeState, 'audit-fix: ' . $action);
+
+        $applied = [];
+        $newContent = $content;
+
+        if ($action === 'replace_content') {
+            if (!isset($body['new_content'])) {
+                return $this->asJson(['ok' => false, 'error' => 'missing_content', 'message' => 'new_content erforderlich (string mit vollem Body-HTML)'])->setStatusCode(400);
+            }
+            // Bewusst KEIN HTML-Stripping à la wp_kses_post: authentifizierter
+            // Plugin-Kontext, und der CKEditor-/Redactor-Purifier greift beim Rendern.
+            $newContent = (string)$body['new_content'];
+            $applied[] = 'post_content_replaced';
+        } else { // append_html_box
+            $customValue = (string)($body['custom_value'] ?? '');
+            if ($customValue === '') {
+                return $this->asJson(['ok' => false, 'error' => 'missing_box', 'message' => 'custom_value (Box-HTML) erforderlich'])->setStatusCode(400);
+            }
+            $payload = is_array($body['payload'] ?? null) ? $body['payload'] : [];
+            // Marker-Sanitize + Regex identisch zum WP-Plugin (v3.24): eigener
+            // Marker pro Box-Typ verhindert Kollisionen auf derselben Seite.
+            $boxMarker = isset($payload['box_marker']) ? preg_replace('/[^a-z0-9_-]/i', '', (string)$payload['box_marker']) : 'deon-cluster-ref';
+            if ($boxMarker === '') {
+                $boxMarker = 'deon-cluster-ref';
+            }
+            $markerRe = '#<aside[^>]*class=["\'][^"\']*' . preg_quote($boxMarker, '#') . '[^"\']*["\'][\s\S]*?</aside>#i';
+            if (preg_match($markerRe, $content)) {
+                $newContent = preg_replace($markerRe, str_replace(['\\', '$'], ['\\\\', '\$'], $customValue), $content, 1);
+                $actionTaken = 'replaced';
+            } else {
+                $newContent = rtrim($content) . "\n\n" . $customValue . "\n";
+                $actionTaken = 'appended';
+            }
+            $applied[] = ($newContent === $content) ? 'no_change' : 'post_content_' . $actionTaken;
+        }
+
+        if ($newContent !== $content) {
+            try {
+                $entry->setFieldValue($bodyHandle, $newContent);
+            } catch (\Throwable $e) {
+                return $this->asJson(['ok' => false, 'error' => 'body_field_not_found'])->setStatusCode(422);
+            }
+            if (!Craft::$app->getElements()->saveElement($entry)) {
+                return $this->asJson(['ok' => false, 'error' => 'update_failed', 'message' => 'Entry-Update fehlgeschlagen', 'details' => $entry->getErrors()])->setStatusCode(500);
+            }
+            // Nachher-Zustand in den Snapshot (Konflikt-Erkennung beim Restore)
+            Craft::$app->getDb()->createCommand()->update('{{%deonai_change_log}}', [
+                'afterJson' => json_encode(array_merge($beforeState, ['bodyValue' => $newContent]), JSON_UNESCAPED_UNICODE),
+                'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
+            ], ['id' => $changeId])->execute();
+        }
+
+        return $this->asJson([
+            'success' => true,
+            'post_id' => $entry->id,
+            'page_url' => $entry->getUrl(),
+            'edit_url' => $entry->getCpEditUrl(),
+            'action' => $action,
+            'rollback_id' => 'rb_' . $changeId,
+            'rollback_available' => true,
+            // Exakter WP-Response-Key ist meta_keys_applied — "applied" (Handoff-
+            // Wortlaut) zusätzlich als Alias, damit beide Worker-Lesarten funktionieren.
+            'meta_keys_applied' => $applied,
+            'applied' => $applied,
+            'plugin_version' => Plugin::getInstance()->getVersion(),
+        ]);
     }
 
     // ─── v0.9.0: Section-Tests + A/B-Varianten (Craft-nativ) ────────────────
