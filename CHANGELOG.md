@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0 - 2026-07-19
+
+### Added
+- `POST /deon-ai/audit-fix` — Content-Write-Fixes vom Deon-AI-Worker (Contract = WP `/audit-fix`, beschränkt auf die zwei für Craft nötigen Actions; alle anderen Fix-Actions laufen bereits über `/deon-ai/seo` bzw. `/deon-ai/faq`):
+  - `replace_content` — kompletten Body-HTML ersetzen (Freshness-Refresh). Bewusst ohne HTML-Stripping — authentifizierter Plugin-Kontext, der CKEditor-/Redactor-Purifier greift beim Rendern.
+  - `append_html_box` — HTML-Box idempotent anhängen (interne Verlinkung, Pillar-Backrefs): existiert bereits ein `<aside class="…{box_marker}…">`-Block (Default-Marker `deon-cluster-ref`, konfigurierbar über `payload.box_marker`), wird er ersetzt statt dupliziert — Marker-Sanitize und Regex identisch zum WP-Plugin.
+  - Beide Actions mit Rollback-Snapshot (Pflichtfeld `rollback_id` in der Response), Entry-Auflösung per `page_url` (URI, Fallback Slug), Berechtigung `allowContentEdit`.
+  - Response liefert `meta_keys_applied` (exakter WP-Key) **und** `applied` als Alias, inkl. `no_change`-Erkennung wie im WP-Original.
+
 ## 0.9.0 - 2026-07-17
 
 ### Added
