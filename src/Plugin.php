@@ -18,10 +18,12 @@ use Craft;
 use craft\base\Model;
 use craft\base\Plugin as BasePlugin;
 use craft\events\PluginEvent;
+use craft\events\RegisterTemplateRootsEvent;
 use craft\events\RegisterUrlRulesEvent;
 use craft\services\Plugins as PluginsService;
 use craft\web\Application as WebApplication;
 use craft\web\UrlManager;
+use craft\web\View;
 use deonai\craftconnect\models\Settings;
 use yii\base\Event;
 use yii\web\Response;
@@ -63,6 +65,18 @@ class Plugin extends BasePlugin
                 if ($event->plugin === $this && !self::$bootstrapping && Craft::$app instanceof WebApplication) {
                     $this->bootstrapFromDeonAi();
                 }
+            }
+        );
+
+        // Eigenes Artikel-Template (templates/entry.twig) unter "deon-ai/entry"
+        // adressierbar machen — lebt im Plugin (vendor), nichts wird in das
+        // templates/-Verzeichnis der Site geschrieben. setup-blog setzt dieses
+        // Template auf den von ihr verwalteten Sections (siehe ApiController).
+        Event::on(
+            View::class,
+            View::EVENT_REGISTER_SITE_TEMPLATE_ROOTS,
+            function (RegisterTemplateRootsEvent $event) {
+                $event->roots['deon-ai'] = __DIR__ . '/templates';
             }
         );
 
@@ -469,13 +483,41 @@ class Plugin extends BasePlugin
     }
 
     /** Body-HTML eines Entries (Settings-Handle, Fallback "deonBody"), fail-soft leer. */
-    private function entryBodyHtml(\craft\elements\Entry $entry): string
+    public function entryBodyHtml(\craft\elements\Entry $entry): string
     {
         /** @var Settings $settings */
         $settings = $this->getSettings();
         foreach (array_unique(array_filter([$settings->blogBodyFieldHandle, 'deonBody'])) as $handle) {
             try {
                 return (string)$entry->getFieldValue($handle);
+            } catch (\Throwable $e) {
+                continue;
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Featured-Image-URL eines Entries, fail-soft (leerer String, falls kein
+     * Feld/Bild vorhanden) — für templates/entry.twig, damit das Template
+     * crasht nie, auch wenn das Bildfeld auf dieser Section fehlt.
+     */
+    public function entryFeaturedImageUrl(\craft\elements\Entry $entry): string
+    {
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        foreach (array_unique(array_filter([$settings->featuredImageFieldHandle, 'deonFeaturedImage'])) as $handle) {
+            try {
+                $value = $entry->getFieldValue($handle);
+                if ($value && method_exists($value, 'one')) {
+                    $asset = $value->one();
+                    if ($asset && method_exists($asset, 'getUrl')) {
+                        $url = $asset->getUrl();
+                        if ($url) {
+                            return (string)$url;
+                        }
+                    }
+                }
             } catch (\Throwable $e) {
                 continue;
             }
