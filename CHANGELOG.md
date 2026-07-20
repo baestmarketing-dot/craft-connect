@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 - 2026-07-20
+
+### Added
+- Plugin liefert jetzt ein eigenes, self-contained Artikel-Template (`templates/entry.twig`, adressierbar als `deon-ai/entry` über einen registrierten Site-Template-Root) — kein Theme-Dependency, kein `{% extends %}`, eigenes Minimal-CSS, keine Deon-Werbung. Behebt den Pilot-Fall, dass ein Custom-Theme-Template Entry-Variablen gar nicht ausgibt und Blog-Artikel dadurch leer bleiben (Titel/Body/Bild liegen korrekt im Entry, nur das Section-Template rendert nichts davon).
+- `setup-blog` setzt dieses Template jetzt direkt auf neu angelegte Sections (`deonBlog`/`deonPages`), statt sie leer zu lassen und nur `template_missing` zu melden.
+- `setup-blog` repariert außerdem **bestehende** Blog-/Seiten-Sections mit leerem Template automatisch — und mit optionalem Body-Flag `{ "fix_template": true }` auch Sections mit einem gesetzten, aber offensichtlich kaputten Template (der Worker prüft das serverseitig, bevor er das Flag sendet). Eine funktionierende Custom-Konfiguration wird nie stillschweigend überschrieben. Response neu: `template`/`previous_template` (Blog-Section, primärer Contract-Wert) sowie additiv `template_pages`/`previous_template_pages`. Jede Template-Änderung ist rollback-fähig (neuer Change-Log-Typ `section_template`).
+
+### Fixed
+- **Kritisch, seit v0.1.0:** Sämtliche Section-Operationen (`getSectionByHandle`, `saveSection`, `saveEntryType`, `getAllSections`) riefen `Craft::$app->getEntries()` auf. Das funktioniert nur auf Craft 5 — dort wurden Section-Methoden in den Entries-Service gemergt. Auf Craft 4 existieren sie ausschließlich im separaten `craft\services\Sections` (`Craft::$app->getSections()`); `craft\services\Entries` kennt dort nur Entry-Element-Methoden. Jeder schreibende Endpoint, der Sections anfasst (`/entry`, `/page`, `/entries`, `/setup-blog`, `/duplicate-page`, `/pages`, `/nav`-Structure-Fallback u. a.), war auf Craft 4 dadurch ein Fatal Error — trotz `composer.json`-Anspruch `craftcms/cms: ^4.0.0|^5.0.0`. Neuer versionsübergreifender Helper `sectionsService()` löst den richtigen Service anhand des registrierten Component-Namens auf, ohne `version_compare`.
+
 ## 0.10.0 - 2026-07-19
 
 ### Added

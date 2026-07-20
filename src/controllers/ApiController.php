@@ -62,6 +62,23 @@ class ApiController extends Controller
         return $this->asJson(['ok' => false, 'error' => 'consent_required', 'permission' => $key])->setStatusCode(403);
     }
 
+    /**
+     * Section-Service versionsübergreifend auflösen. KRITISCH: In Craft 5
+     * wurden Section-Methoden (getSectionByHandle/saveSection/saveEntryType/
+     * getAllSections/…) in den Entries-Service gemergt — craft\services\Entries
+     * hat sie dort. In Craft 4 existieren sie NUR im separaten
+     * craft\services\Sections (Craft::$app->getSections()); craft\services\
+     * Entries kennt in Craft 4 ausschließlich Entry-Element-Methoden.
+     * Craft::$app->getEntries()->getSectionByHandle() ist auf Craft 4 also ein
+     * Fatal Error ("Call to undefined method") — composer.json erlaubt aber
+     * ^4.0.0|^5.0.0. Erkennung über den registrierten Component-Namen statt
+     * version_compare, damit es robust gegen künftige Verschiebungen bleibt.
+     */
+    private function sectionsService(): object
+    {
+        return Craft::$app->has('sections') ? Craft::$app->get('sections') : Craft::$app->getEntries();
+    }
+
     /** GET /deon-ai/ping — Health + Versionen (für "Verbindung prüfen"). */
     public function actionPing(): Response
     {
@@ -96,8 +113,8 @@ class ApiController extends Controller
                 'ab_script_inject', 'tracker_inject', 'audit_fix',
             ],
             'sections_ok' => [
-                'blog' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle),
-                'pages' => (bool)Craft::$app->getEntries()->getSectionByHandle($settings->pagesSectionHandle ?: $settings->blogSectionHandle),
+                'blog' => (bool)$this->sectionsService()->getSectionByHandle($settings->blogSectionHandle),
+                'pages' => (bool)$this->sectionsService()->getSectionByHandle($settings->pagesSectionHandle ?: $settings->blogSectionHandle),
             ],
             // Echte Handle-Existenz, nicht nur "ist das Setting nicht leer" —
             // ein Setting kann auf einen längst gelöschten Feld-Handle zeigen.
@@ -322,7 +339,7 @@ class ApiController extends Controller
         $sectionHandle = !empty($body['section']) ? (string)$body['section'] : $settings->blogSectionHandle;
         $bodyFieldHandle = !empty($body['body_field']) ? (string)$body['body_field'] : $settings->blogBodyFieldHandle;
 
-        $section = Craft::$app->getEntries()->getSectionByHandle($sectionHandle);
+        $section = $this->sectionsService()->getSectionByHandle($sectionHandle);
         if (!$section) {
             return $this->asJson([
                 'ok' => false,
@@ -431,7 +448,7 @@ class ApiController extends Controller
         $sectionHandle = (string)(Craft::$app->getRequest()->getQueryParam('section') ?: $settings->blogSectionHandle);
         $limit = min((int)(Craft::$app->getRequest()->getQueryParam('limit') ?: 50), 200);
 
-        $section = Craft::$app->getEntries()->getSectionByHandle($sectionHandle);
+        $section = $this->sectionsService()->getSectionByHandle($sectionHandle);
         if (!$section) {
             return $this->asJson([
                 'ok' => false,
@@ -646,7 +663,7 @@ class ApiController extends Controller
             ? (string)$body['section']
             : (!empty($settings->pagesSectionHandle) ? $settings->pagesSectionHandle : $settings->blogSectionHandle);
 
-        $section = Craft::$app->getEntries()->getSectionByHandle($sectionHandle);
+        $section = $this->sectionsService()->getSectionByHandle($sectionHandle);
         if (!$section) {
             return $this->asJson([
                 'ok' => false,
@@ -724,12 +741,16 @@ class ApiController extends Controller
     private const DEON_BLOG_SECTION_HANDLE = 'deonBlog';
     private const DEON_PAGES_SECTION_HANDLE = 'deonPages';
 
+    /** Handle des Site-Template-Roots + Template, das das Plugin selbst mitliefert (siehe templates/entry.twig). */
+    private const DEON_ENTRY_TEMPLATE = 'deon-ai/entry';
+
     /**
      * POST /deon-ai/setup-blog — legt Blog-/Seiten-Section, Body- und
      * Featured-Image-Feld an, falls sie fehlen, und verdrahtet die
      * Plugin-Settings automatisch damit. Idempotent: bestehende, gültige
      * Handles werden NIE angetastet — nur leere/kaputte Settings werden
-     * (um)geschrieben.
+     * (um)geschrieben. Body optional: { fix_template?: bool } — siehe
+     * ensureSectionTemplate().
      */
     public function actionSetupBlog(): Response
     {
@@ -738,9 +759,11 @@ class ApiController extends Controller
             return $response;
         }
         $this->requirePostRequest();
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $fixTemplate = !empty($body['fix_template']);
 
         $fieldsService = Craft::$app->getFields();
-        $entriesService = Craft::$app->getEntries();
+        $entriesService = $this->sectionsService();
         $result = [
             'ok' => true,
             'fields' => [],
@@ -780,16 +803,22 @@ class ApiController extends Controller
             }
         }
 
-        // 3) Sections
+        // 3) Sections. Neue Sections bekommen sofort unser eigenes, funktionierendes
+        // Artikel-Template (siehe templates/entry.twig) statt leer + template_missing.
+        // Bestehende Sections: Template nur anfassen, wenn leer oder fix_template
+        // explizit gesetzt ist — siehe ensureSectionTemplate().
         $blogSection = $entriesService->getSectionByHandle(self::DEON_BLOG_SECTION_HANDLE);
         if ($blogSection) {
             $result['sections']['blog'] = 'existing';
+            [$blogTemplateOutcome, $blogPreviousTemplate] = $this->ensureSectionTemplate($blogSection, $fixTemplate);
         } else {
             $blogSection = $this->createDeonSection(self::DEON_BLOG_SECTION_HANDLE, 'Blog', Section::TYPE_CHANNEL, 'blog/{slug}', $bodyField, $imageField);
             if (!$blogSection) {
                 return $this->asJson(['ok' => false, 'error' => 'blog_section_save_failed'])->setStatusCode(500);
             }
             $result['sections']['blog'] = 'created';
+            $blogTemplateOutcome = 'set';
+            $blogPreviousTemplate = null;
         }
         if (!$this->sectionHasTemplate($blogSection)) {
             $result['template_missing'][] = 'blog';
@@ -798,15 +827,30 @@ class ApiController extends Controller
         $pagesSection = $entriesService->getSectionByHandle(self::DEON_PAGES_SECTION_HANDLE);
         if ($pagesSection) {
             $result['sections']['pages'] = 'existing';
+            [$pagesTemplateOutcome, $pagesPreviousTemplate] = $this->ensureSectionTemplate($pagesSection, $fixTemplate);
         } else {
             $pagesSection = $this->createDeonSection(self::DEON_PAGES_SECTION_HANDLE, 'Seiten', Section::TYPE_STRUCTURE, '{slug}', $bodyField, $imageField);
             if (!$pagesSection) {
                 return $this->asJson(['ok' => false, 'error' => 'pages_section_save_failed'])->setStatusCode(500);
             }
             $result['sections']['pages'] = 'created';
+            $pagesTemplateOutcome = 'set';
+            $pagesPreviousTemplate = null;
         }
         if (!$this->sectionHasTemplate($pagesSection)) {
             $result['template_missing'][] = 'pages';
+        }
+
+        // Primärer Contract-Wert = Blog-Section (der Pilot-Fall, für den dieses
+        // Feature gebaut wurde). Pages additiv unter *_pages, damit ein Worker,
+        // der nur "template"/"previous_template" liest, unverändert funktioniert.
+        $result['template'] = $blogTemplateOutcome;
+        if ($blogPreviousTemplate !== null) {
+            $result['previous_template'] = $blogPreviousTemplate;
+        }
+        $result['template_pages'] = $pagesTemplateOutcome;
+        if ($pagesPreviousTemplate !== null) {
+            $result['previous_template_pages'] = $pagesPreviousTemplate;
         }
 
         // 4) Settings auto-verdrahten — nur wenn leer oder auf einen längst
@@ -888,7 +932,7 @@ class ApiController extends Controller
         ]);
         $entryType->setFieldLayout($fieldLayout);
 
-        if (!Craft::$app->getEntries()->saveEntryType($entryType)) {
+        if (!$this->sectionsService()->saveEntryType($entryType)) {
             return null;
         }
 
@@ -899,6 +943,7 @@ class ApiController extends Controller
                 'enabledByDefault' => true,
                 'hasUrls' => true,
                 'uriFormat' => $uriFormat,
+                'template' => self::DEON_ENTRY_TEMPLATE,
             ]);
         }
 
@@ -909,7 +954,7 @@ class ApiController extends Controller
         $section->setEntryTypes([$entryType]);
         $section->setSiteSettings($siteSettings);
 
-        if (!Craft::$app->getEntries()->saveSection($section)) {
+        if (!$this->sectionsService()->saveSection($section)) {
             return null;
         }
         return $section;
@@ -923,6 +968,58 @@ class ApiController extends Controller
             }
         }
         return false;
+    }
+
+    /**
+     * Setzt das Site-Template einer BESTEHENDEN Section auf unser Artikel-
+     * Template — aber nur, wenn es leer ist oder $force (Body-Flag
+     * "fix_template") gesetzt wurde. Überschreibt nie stillschweigend eine
+     * funktionierende Custom-Konfiguration. Protokolliert die Änderung
+     * rollback-fähig (Ziel-Typ "section_template").
+     * @return array{0: string, 1: ?string} [outcome ("kept"|"set"|"fixed"), previousTemplate]
+     */
+    private function ensureSectionTemplate(Section $section, bool $force): array
+    {
+        $siteSettingsList = $section->getSiteSettings();
+        $anyEmpty = false;
+        $previousTemplate = null;
+        foreach ($siteSettingsList as $s) {
+            if (empty($s->template)) {
+                $anyEmpty = true;
+            } else {
+                $previousTemplate = $s->template;
+            }
+        }
+
+        if ($previousTemplate === self::DEON_ENTRY_TEMPLATE && !$anyEmpty) {
+            // Läuft schon über unser eigenes Template — nichts zu tun.
+            return ['kept', null];
+        }
+        if (!$anyEmpty && !$force) {
+            return ['kept', null];
+        }
+
+        $outcome = $anyEmpty ? 'set' : 'fixed';
+        foreach ($siteSettingsList as $s) {
+            $s->template = self::DEON_ENTRY_TEMPLATE;
+        }
+        $section->setSiteSettings($siteSettingsList);
+        if (!$this->sectionsService()->saveSection($section)) {
+            return ['kept', null];
+        }
+
+        // rollback_id wird hier nicht direkt zurückgegeben (setup-blog ändert
+        // potenziell zwei Sections in einem Call) — Rollback läuft über
+        // /rollback/list wie bei jeder anderen protokollierten Änderung auch.
+        $this->logChange(
+            'section_template',
+            $section->handle,
+            ['template' => $previousTemplate],
+            ['template' => self::DEON_ENTRY_TEMPLATE],
+            'setup-blog: Template ' . $outcome
+        );
+
+        return [$outcome, $previousTemplate];
     }
 
     /** Minimales Beispiel-Template als String im Response — wird NICHT selbst ins templates/-Verzeichnis geschrieben. */
@@ -1074,7 +1171,7 @@ TWIG;
     private function navViaStructureSection(string $url, string $title, ?int $entryId): ?Response
     {
         $navSection = null;
-        foreach (Craft::$app->getEntries()->getAllSections() as $section) {
+        foreach ($this->sectionsService()->getAllSections() as $section) {
             if ($section->type === Section::TYPE_STRUCTURE && preg_match('/nav|menu/i', $section->handle)) {
                 $navSection = $section;
                 break;
@@ -2961,6 +3058,7 @@ TWIG;
                 'hygiene' => $this->rollbackHygiene($log['targetKey'], $before),
                 'entry' => $this->rollbackEntry($log['targetKey'], $before),
                 'restore_point' => $this->restoreSnapshot(json_decode($log['afterJson'], true) ?: []),
+                'section_template' => $this->rollbackSectionTemplate($log['targetKey'], $before),
                 default => ['ok' => false, 'error' => 'unknown_target_type'],
             };
         } catch (\Throwable $e) {
@@ -3000,7 +3098,7 @@ TWIG;
             'entries' => [],
         ];
 
-        $section = Craft::$app->getEntries()->getSectionByHandle($settings->blogSectionHandle);
+        $section = $this->sectionsService()->getSectionByHandle($settings->blogSectionHandle);
         if ($section) {
             $entries = Entry::find()->sectionId($section->id)->status(null)->limit(200)->all();
             foreach ($entries as $entry) {
@@ -3032,6 +3130,7 @@ TWIG;
         'hygiene' => 'robots.txt/llms.txt',
         'entry' => 'Blog-Entry',
         'restore_point' => 'Sicherungspunkt',
+        'section_template' => 'Section-Template',
     ];
 
     private function findChangeLog(string $rawId): ?array
@@ -3133,6 +3232,23 @@ TWIG;
             'content' => $before['content'] ?? '',
             'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
         ], ['type' => $type])->execute();
+        return ['ok' => true, 'action' => 'restored'];
+    }
+
+    private function rollbackSectionTemplate(string $handle, ?array $before): array
+    {
+        $section = $this->sectionsService()->getSectionByHandle($handle);
+        if (!$section) {
+            return ['ok' => false, 'error' => 'section_no_longer_exists'];
+        }
+        $siteSettingsList = $section->getSiteSettings();
+        foreach ($siteSettingsList as $s) {
+            $s->template = $before['template'] ?? null;
+        }
+        $section->setSiteSettings($siteSettingsList);
+        if (!$this->sectionsService()->saveSection($section)) {
+            return ['ok' => false, 'error' => 'save_failed', 'details' => $section->getErrors()];
+        }
         return ['ok' => true, 'action' => 'restored'];
     }
 
