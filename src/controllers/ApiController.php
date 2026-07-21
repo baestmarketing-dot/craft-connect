@@ -743,6 +743,7 @@ class ApiController extends Controller
 
     /** Handle des Site-Template-Roots + Template, das das Plugin selbst mitliefert (siehe templates/entry.twig). */
     private const DEON_ENTRY_TEMPLATE = 'deon-ai/entry';
+    private const DEON_PAGE_TEMPLATE = 'deon-ai/page';
 
     /**
      * POST /deon-ai/setup-blog — legt Blog-/Seiten-Section, Body- und
@@ -803,16 +804,34 @@ class ApiController extends Controller
             }
         }
 
-        // 3) Sections. Neue Sections bekommen sofort unser eigenes, funktionierendes
-        // Artikel-Template (siehe templates/entry.twig) statt leer + template_missing.
-        // Bestehende Sections: Template nur anfassen, wenn leer oder fix_template
-        // explizit gesetzt ist — siehe ensureSectionTemplate().
-        $blogSection = $entriesService->getSectionByHandle(self::DEON_BLOG_SECTION_HANDLE);
+        // 3) Sections. Effektiven Section-Handle bestimmen: den bereits in den
+        // Settings konfigurierten Handle, falls er auf eine wirklich
+        // existierende Section zeigt — sonst unseren Bootstrap-Handle
+        // (deonBlog/deonPages). WICHTIG: /entry und /page bespielen
+        // settings.blogSectionHandle/pagesSectionHandle (Default "blog"/
+        // "pages"), NICHT die deonBlog/deonPages-Konstanten — ohne diese
+        // Auflösung würde die Template-Reparatur eine ungenutzte
+        // deonBlog/deonPages-Section anlegen/fixen, während die Site
+        // weiterhin über "blog"/"pages" ausliefert und optisch kaputt bleibt.
+        $settings = Plugin::getInstance()->getSettings();
+        $blogHandle = (!empty($settings->blogSectionHandle) && $entriesService->getSectionByHandle($settings->blogSectionHandle))
+            ? $settings->blogSectionHandle
+            : self::DEON_BLOG_SECTION_HANDLE;
+        $pagesHandle = (!empty($settings->pagesSectionHandle) && $entriesService->getSectionByHandle($settings->pagesSectionHandle))
+            ? $settings->pagesSectionHandle
+            : self::DEON_PAGES_SECTION_HANDLE;
+
+        // Neue Sections bekommen sofort unser eigenes, funktionierendes
+        // Template (templates/entry.twig bzw. templates/page.twig) statt leer
+        // + template_missing. Bestehende Sections: Template nur anfassen,
+        // wenn leer oder fix_template explizit gesetzt ist — siehe
+        // ensureSectionTemplate().
+        $blogSection = $entriesService->getSectionByHandle($blogHandle);
         if ($blogSection) {
             $result['sections']['blog'] = 'existing';
-            [$blogTemplateOutcome, $blogPreviousTemplate] = $this->ensureSectionTemplate($blogSection, $fixTemplate);
+            [$blogTemplateOutcome, $blogPreviousTemplate] = $this->ensureSectionTemplate($blogSection, $fixTemplate, self::DEON_ENTRY_TEMPLATE);
         } else {
-            $blogSection = $this->createDeonSection(self::DEON_BLOG_SECTION_HANDLE, 'Blog', Section::TYPE_CHANNEL, 'blog/{slug}', $bodyField, $imageField);
+            $blogSection = $this->createDeonSection($blogHandle, 'Blog', Section::TYPE_CHANNEL, 'blog/{slug}', $bodyField, $imageField, self::DEON_ENTRY_TEMPLATE);
             if (!$blogSection) {
                 return $this->asJson(['ok' => false, 'error' => 'blog_section_save_failed'])->setStatusCode(500);
             }
@@ -824,12 +843,12 @@ class ApiController extends Controller
             $result['template_missing'][] = 'blog';
         }
 
-        $pagesSection = $entriesService->getSectionByHandle(self::DEON_PAGES_SECTION_HANDLE);
+        $pagesSection = $entriesService->getSectionByHandle($pagesHandle);
         if ($pagesSection) {
             $result['sections']['pages'] = 'existing';
-            [$pagesTemplateOutcome, $pagesPreviousTemplate] = $this->ensureSectionTemplate($pagesSection, $fixTemplate);
+            [$pagesTemplateOutcome, $pagesPreviousTemplate] = $this->ensureSectionTemplate($pagesSection, $fixTemplate, self::DEON_PAGE_TEMPLATE);
         } else {
-            $pagesSection = $this->createDeonSection(self::DEON_PAGES_SECTION_HANDLE, 'Seiten', Section::TYPE_STRUCTURE, '{slug}', $bodyField, $imageField);
+            $pagesSection = $this->createDeonSection($pagesHandle, 'Seiten', Section::TYPE_STRUCTURE, '{slug}', $bodyField, $imageField, self::DEON_PAGE_TEMPLATE);
             if (!$pagesSection) {
                 return $this->asJson(['ok' => false, 'error' => 'pages_section_save_failed'])->setStatusCode(500);
             }
@@ -853,16 +872,16 @@ class ApiController extends Controller
             $result['previous_template_pages'] = $pagesPreviousTemplate;
         }
 
-        // 4) Settings auto-verdrahten — nur wenn leer oder auf einen längst
-        // ungültigen Handle zeigend; eine bestehende, funktionierende
-        // Konfiguration wird nie überschrieben.
-        $settings = Plugin::getInstance()->getSettings();
+        // 4) Settings auf die tatsächlich verwendeten Handles verdrahten (oben
+        // bereits aufgelöst) — eine bestehende, funktionierende Konfiguration
+        // wird dabei nie überschrieben, da $blogHandle/$pagesHandle bereits
+        // deren aktuellen Wert übernehmen, wenn er gültig war.
         $updates = [];
-        if (empty($settings->blogSectionHandle) || !$entriesService->getSectionByHandle($settings->blogSectionHandle)) {
-            $updates['blogSectionHandle'] = self::DEON_BLOG_SECTION_HANDLE;
+        if ($settings->blogSectionHandle !== $blogHandle) {
+            $updates['blogSectionHandle'] = $blogHandle;
         }
-        if (empty($settings->pagesSectionHandle) || !$entriesService->getSectionByHandle($settings->pagesSectionHandle)) {
-            $updates['pagesSectionHandle'] = self::DEON_PAGES_SECTION_HANDLE;
+        if ($settings->pagesSectionHandle !== $pagesHandle) {
+            $updates['pagesSectionHandle'] = $pagesHandle;
         }
         if (empty($settings->blogBodyFieldHandle) || !$fieldsService->getFieldByHandle($settings->blogBodyFieldHandle)) {
             $updates['blogBodyFieldHandle'] = self::DEON_BODY_FIELD_HANDLE;
@@ -915,7 +934,7 @@ class ApiController extends Controller
     }
 
     /** Legt eine Section (Channel oder Structure) samt Entry-Type + Field-Layout (Title + Body [+ Bild]) an. */
-    private function createDeonSection(string $handle, string $name, string $type, string $uriFormat, \craft\base\FieldInterface $bodyField, ?AssetsField $imageField): ?Section
+    private function createDeonSection(string $handle, string $name, string $type, string $uriFormat, \craft\base\FieldInterface $bodyField, ?AssetsField $imageField, string $template): ?Section
     {
         $entryType = new EntryType();
         $entryType->name = $name;
@@ -943,7 +962,7 @@ class ApiController extends Controller
                 'enabledByDefault' => true,
                 'hasUrls' => true,
                 'uriFormat' => $uriFormat,
-                'template' => self::DEON_ENTRY_TEMPLATE,
+                'template' => $template,
             ]);
         }
 
@@ -978,7 +997,7 @@ class ApiController extends Controller
      * rollback-fähig (Ziel-Typ "section_template").
      * @return array{0: string, 1: ?string} [outcome ("kept"|"set"|"fixed"), previousTemplate]
      */
-    private function ensureSectionTemplate(Section $section, bool $force): array
+    private function ensureSectionTemplate(Section $section, bool $force, string $targetTemplate): array
     {
         $siteSettingsList = $section->getSiteSettings();
         $anyEmpty = false;
@@ -991,7 +1010,7 @@ class ApiController extends Controller
             }
         }
 
-        if ($previousTemplate === self::DEON_ENTRY_TEMPLATE && !$anyEmpty) {
+        if ($previousTemplate === $targetTemplate && !$anyEmpty) {
             // Läuft schon über unser eigenes Template — nichts zu tun.
             return ['kept', null];
         }
@@ -1001,7 +1020,7 @@ class ApiController extends Controller
 
         $outcome = $anyEmpty ? 'set' : 'fixed';
         foreach ($siteSettingsList as $s) {
-            $s->template = self::DEON_ENTRY_TEMPLATE;
+            $s->template = $targetTemplate;
         }
         $section->setSiteSettings($siteSettingsList);
         if (!$this->sectionsService()->saveSection($section)) {
@@ -1015,7 +1034,7 @@ class ApiController extends Controller
             'section_template',
             $section->handle,
             ['template' => $previousTemplate],
-            ['template' => self::DEON_ENTRY_TEMPLATE],
+            ['template' => $targetTemplate],
             'setup-blog: Template ' . $outcome
         );
 
