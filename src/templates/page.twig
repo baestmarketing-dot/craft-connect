@@ -1,0 +1,66 @@
+{#
+  Self-contained Fallback-Seiten-Template — lebt im Plugin, nicht in der
+  Site. Wird von setup-blog auf die pages-Section (Standort-/Leistungs-
+  seiten aus POST /deon-ai/page) gesetzt, deren eigenes Theme keine Entry-
+  Variablen ausgibt (bzw. die noch gar kein Template hat). Kein Theme-
+  Dependency: eigenes Minimal-CSS, kein {% extends %}. SEO-Tags (Canonical,
+  Meta, JSON-LD), SDK, Footer-Links und der Section-Test-/A-B-Split laufen
+  über den bestehenden Response-Patcher (Plugin::init()) und brauchen nur
+  <head>/<body> — die liefert dieses Template.
+
+  Der Worker liefert body_html bereits vollständig gestylt (FAQ-Akkordeon,
+  CTA-Button etc., inline gestylt) und bewusst OHNE <h1> — das Template
+  rendert den Titel deshalb immer selbst.
+#}
+{% set deonPlugin = craft.app.plugins.getPlugin('deon-ai-connect') %}
+{% set deonBodyHtml = deonPlugin ? deonPlugin.entryBodyHtml(entry) : '' %}
+{% set deonImageUrl = deonPlugin ? deonPlugin.entryFeaturedImageUrl(entry) : '' %}
+<!DOCTYPE html>
+<html lang="{{ craft.app.language }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ entry.title }}</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1a1a;
+    background: #ffffff;
+    line-height: 1.65;
+  }
+  .deon-page-wrap { max-width: 760px; margin: 0 auto; padding: 48px 20px 80px; }
+  .deon-back-link {
+    display: inline-block;
+    margin-bottom: 32px;
+    color: #555;
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .deon-back-link:hover { text-decoration: underline; }
+  .deon-page-wrap h1 { font-size: 2rem; line-height: 1.25; margin: 0 0 28px; }
+  .deon-featured-image { width: 100%; height: auto; border-radius: 8px; margin-bottom: 32px; display: block; }
+  .deon-page-body { font-size: 1.05rem; }
+  .deon-page-body img { max-width: 100%; height: auto; border-radius: 6px; }
+  .deon-page-body h2 { font-size: 1.5rem; margin-top: 2em; }
+  .deon-page-body h3 { font-size: 1.25rem; margin-top: 1.75em; }
+  .deon-page-body a { color: #1a56db; }
+</style>
+</head>
+<body>
+<div class="deon-page-wrap">
+  <a class="deon-back-link" href="{{ siteUrl() }}">&larr; {{ 'Zur Startseite'|t('deon-ai-connect') }}</a>
+  <article>
+    <h1>{{ entry.title }}</h1>
+    {% if deonImageUrl %}
+      <img class="deon-featured-image" src="{{ deonImageUrl }}" alt="{{ entry.title }}">
+    {% endif %}
+    <div class="deon-page-body">
+      {{ deonBodyHtml|raw }}
+    </div>
+  </article>
+</div>
+</body>
+</html>

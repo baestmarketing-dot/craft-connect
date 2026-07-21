@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0 - 2026-07-21
+
+### Added
+- Plugin liefert jetzt zusätzlich zum Artikel-Template (v0.11.0) ein eigenes, self-contained Seiten-Template (`templates/page.twig`, adressierbar als `deon-ai/page`) für die per `POST /deon-ai/page` erzeugten Standort-/Leistungsseiten. Rendert `entry.title` immer als H1 (der Worker liefert bewusst keinen H1 im `body_html`) und gibt das vom Worker gelieferte, bereits gestylte HTML (FAQ-Akkordeon, CTA-Button etc.) unverändert `|raw` aus — kein RTE-Sanitizer, kein Theme-Dependency.
+- `setup-blog` setzt/repariert das Template jetzt auch für die `pages`-Section — gleiches idempotentes Verhalten wie beim Blog: neue Sections bekommen `deon-ai/page` direkt, bestehende Sections mit leerem Template werden automatisch repariert, bestehende Sections mit gesetztem Template nur mit `{ "fix_template": true }`. `template_pages`/`previous_template_pages` in der Response (additiv neben `template`/`previous_template` für Blog).
+
+### Fixed
+- **Kritisch:** `setup-blog` prüfte/reparierte bislang ausschließlich die eigenen Bootstrap-Sections `deonBlog`/`deonPages` — unabhängig davon, ob `settings.blogSectionHandle`/`pagesSectionHandle` (Standard `"blog"`/`"pages"`) bereits auf eine andere, tatsächlich existierende Section zeigten. `/deon-ai/entry` und `/deon-ai/page` bespielen aber genau diese konfigurierten Handles, nicht die Bootstrap-Konstanten. Auf Installationen, deren Blog-/Seiten-Section nicht `deonBlog`/`deonPages` heißt (z. B. der Default `"pages"`), reparierte `setup-blog` dadurch eine ungenutzte Section, während die tatsächlich ausgelieferte Seite weiterhin ohne Template/Styling blieb. `setup-blog` löst den Ziel-Handle jetzt zuerst aus den aktuellen Settings auf (nur Fallback auf `deonBlog`/`deonPages`, wenn der konfigurierte Handle leer oder ungültig ist) und wirkt dadurch immer auf die Section, die auch wirklich ausliefert.
+
 ## 0.11.0 - 2026-07-20
 
 ### Added
