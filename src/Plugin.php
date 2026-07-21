@@ -117,6 +117,8 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/tracker-status'] = 'deon-ai-connect/api/tracker-status';
                 // v0.10.0 — Content-Write-Fixes (Freshness-Refresh, interne Verlinkung)
                 $event->rules['deon-ai/audit-fix'] = 'deon-ai-connect/api/audit-fix';
+                // v0.13.0 — Asset-Bibliothek für Bild-Matching (Pendant zu WP wp-json/wp/v2/media)
+                $event->rules['deon-ai/media'] = 'deon-ai-connect/api/media';
 
                 // Full-Page-Landingpages (/deon-ai/publish-lp): eine Route pro
                 // aktivem Slug. Fail-soft: Tabelle existiert vor der Migration

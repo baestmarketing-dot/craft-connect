@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0 - 2026-07-21
+
+### Added
+- `GET /deon-ai/media` — Bild-Bibliothek der Site über alle Asset-Volumes (`url`, `alt`, `title`, `filename`, `w`, `h`), Pendant zu WPs `wp-json/wp/v2/media?media_type=image`. Der Worker matcht damit passende Bilder in generierte Sektionen — bislang lief der Aufruf für Craft ins Leere, weil kein Endpoint existierte. Read-only, nicht consent-gated. `/deon-ai/ping`-`capabilities` um `media_inventory` ergänzt.
+- `setup-blog` prüft und repariert jetzt zusätzlich, ob der Entry-Type der Blog-/Seiten-Section überhaupt ein Titel-Attribut tragen kann. Response neu: `title_field`/`title_field_pages` (`"ok"|"missing"|"fixed"`), Reparatur nur mit `{ "fix_template": true }` (dieselbe Freigabe wie für die Template-Reparatur).
+- `/deon-ai/entry` und `/deon-ai/page` brechen jetzt mit `422 title_field_missing` ab, statt eine Seite zu veröffentlichen, deren Titel Craft beim Speichern automatisch leert.
+
+### Fixed
+- **Ursache von „Eintrag ohne Titel" im CP gefunden und behoben** (nicht der im Handoff vermutete Ort): `/entry` und `/page` haben `entry->title` schon immer korrekt gesetzt. Der eigentliche Grund liegt in Craft selbst — `craft\elements\Entry::updateTitle()` läuft unumgehbar in jedem `beforeSave()` und überschreibt den gesetzten Titel automatisch mit leer, sobald der Entry-Type kein Titel-Feld (`hasTitleField`) **und** kein `titleFormat` hat. Betroffen sind ausschließlich extern (nicht über `setup-blog`) angelegte Sections — die vom Plugin selbst erzeugten (`deonBlog`/`deonPages`) hatten `hasTitleField` schon immer aktiv.
+
 ## 0.12.0 - 2026-07-21
 
 ### Added

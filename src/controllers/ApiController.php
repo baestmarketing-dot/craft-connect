@@ -79,6 +79,29 @@ class ApiController extends Controller
         return Craft::$app->has('sections') ? Craft::$app->get('sections') : Craft::$app->getEntries();
     }
 
+    /**
+     * Verhindert "Eintrag ohne Titel" im CP: Craft überschreibt jeden von uns
+     * gesetzten Titel automatisch mit leer/berechnet, sobald der Entry-Type
+     * kein Titel-Feld hat (craft\elements\Entry::updateTitle(), läuft
+     * unumgehbar in beforeSave()) — außer ein titleFormat ist konfiguriert
+     * und liefert selbst einen Wert. Betrifft nur Entry-Types, die NICHT über
+     * createDeonSection() angelegt wurden (die setzen hasTitleField immer),
+     * also bestehende, extern konfigurierte Sections. Statt eine Deon-AI-
+     * Seite scheinbar erfolgreich, aber untitled zu veröffentlichen, brechen
+     * wir hier mit einer klaren Anleitung ab.
+     */
+    private function checkEntryTypeTitleField(EntryType $entryType): ?Response
+    {
+        if ($entryType->hasTitleField || !empty($entryType->titleFormat)) {
+            return null;
+        }
+        return $this->asJson([
+            'ok' => false,
+            'error' => 'title_field_missing',
+            'hint' => 'Entry-Type "' . $entryType->handle . '" hat weder ein Titel-Feld noch ein titleFormat — Craft würde jeden gesetzten Titel beim Speichern automatisch leeren (Ergebnis: "Eintrag ohne Titel" im CP). Mit POST /deon-ai/setup-blog { "fix_template": true } beheben (aktiviert das Titel-Feld für diesen Entry-Type).',
+        ])->setStatusCode(422);
+    }
+
     /** GET /deon-ai/ping — Health + Versionen (für "Verbindung prüfen"). */
     public function actionPing(): Response
     {
@@ -110,7 +133,7 @@ class ApiController extends Controller
                 'widget_texts', 'publish_lp', 'theme_tokens', 'seo_schema',
                 'sitemap_discover', 'footer_links',
                 'content_replace', 'section_test', 'ab_variant_split',
-                'ab_script_inject', 'tracker_inject', 'audit_fix',
+                'ab_script_inject', 'tracker_inject', 'audit_fix', 'media_inventory',
             ],
             'sections_ok' => [
                 'blog' => (bool)$this->sectionsService()->getSectionByHandle($settings->blogSectionHandle),
@@ -366,11 +389,17 @@ class ApiController extends Controller
                 $beforeState['imageFieldHandle'] = $settings->featuredImageFieldHandle;
                 $beforeState['imageAssetIds'] = $this->safeFieldAssetIds($entry, $settings->featuredImageFieldHandle);
             }
+            $targetEntryType = $entry->getType();
         } else {
             $entry = new Entry();
             $entry->sectionId = $section->id;
             $entryTypes = $section->getEntryTypes();
             $entry->typeId = $entryTypes[0]->id;
+            $targetEntryType = $entryTypes[0];
+        }
+
+        if ($response = $this->checkEntryTypeTitleField($targetEntryType)) {
+            return $response;
         }
 
         $entry->title = mb_substr($title, 0, 255);
@@ -681,6 +710,13 @@ class ApiController extends Controller
             $entry->sectionId = $section->id;
             $entryTypes = $section->getEntryTypes();
             $entry->typeId = $entryTypes[0]->id;
+            $targetEntryType = $entryTypes[0];
+        } else {
+            $targetEntryType = $entry->getType();
+        }
+
+        if ($response = $this->checkEntryTypeTitleField($targetEntryType)) {
+            return $response;
         }
 
         $entry->title = mb_substr($title, 0, 255);
@@ -842,6 +878,7 @@ class ApiController extends Controller
         if (!$this->sectionHasTemplate($blogSection)) {
             $result['template_missing'][] = 'blog';
         }
+        $result['title_field'] = $this->ensureEntryTypeHasTitleField($blogSection, $fixTemplate);
 
         $pagesSection = $entriesService->getSectionByHandle($pagesHandle);
         if ($pagesSection) {
@@ -859,6 +896,7 @@ class ApiController extends Controller
         if (!$this->sectionHasTemplate($pagesSection)) {
             $result['template_missing'][] = 'pages';
         }
+        $result['title_field_pages'] = $this->ensureEntryTypeHasTitleField($pagesSection, $fixTemplate);
 
         // Primärer Contract-Wert = Blog-Section (der Pilot-Fall, für den dieses
         // Feature gebaut wurde). Pages additiv unter *_pages, damit ein Worker,
@@ -1039,6 +1077,35 @@ class ApiController extends Controller
         );
 
         return [$outcome, $previousTemplate];
+    }
+
+    /**
+     * Prüft, ob der (erste) Entry-Type der Section überhaupt einen Titel
+     * tragen kann (hasTitleField oder titleFormat) — sonst würde Craft jeden
+     * von /entry bzw. /page gesetzten Titel beim Speichern automatisch leeren
+     * (siehe checkEntryTypeTitleField()). Repariert nur bei $force
+     * (Body-Flag "fix_template", dieselbe Freigabe wie fürs Section-Template)
+     * durch Setzen von hasTitleField=true — nie stillschweigend, das würde
+     * ggf. ein bewusst gewähltes titleFormat-Schema überschreiben. Bewusst
+     * nicht im Rollback-Journal protokolliert (wie die Feld-/Section-Anlage
+     * in Schritt 1/2/3 auch): additiv, keine bestehenden Werte gehen verloren.
+     * @return string "ok"|"missing"|"fixed"
+     */
+    private function ensureEntryTypeHasTitleField(Section $section, bool $force): string
+    {
+        $entryTypes = $section->getEntryTypes();
+        $entryType = $entryTypes[0] ?? null;
+        if (!$entryType || $entryType->hasTitleField || !empty($entryType->titleFormat)) {
+            return 'ok';
+        }
+        if (!$force) {
+            return 'missing';
+        }
+        $entryType->hasTitleField = true;
+        if (!$this->sectionsService()->saveEntryType($entryType)) {
+            return 'missing';
+        }
+        return 'fixed';
     }
 
     /** Minimales Beispiel-Template als String im Response — wird NICHT selbst ins templates/-Verzeichnis geschrieben. */
@@ -1281,6 +1348,34 @@ TWIG;
             ->limit($perPage)
             ->all();
         return $this->asJson(array_map(fn(Entry $e) => $this->entrySummary($e), $entries));
+    }
+
+    /**
+     * GET /deon-ai/media?per_page= — Bild-Bibliothek der Site (alle Volumes),
+     * für Bild-Matching in generierten Sektionen. Pendant zu WP
+     * wp-json/wp/v2/media?media_type=image. Read-only, nicht consent-gated
+     * (wie /pages, /entries).
+     */
+    public function actionMedia(): Response
+    {
+        $this->requireDeonKey();
+        $perPage = min((int)(Craft::$app->getRequest()->getQueryParam('per_page') ?: 100), 200);
+        $assets = Asset::find()
+            ->kind('image')
+            ->orderBy(['dateCreated' => SORT_DESC])
+            ->limit($perPage)
+            ->all();
+        $items = array_map(static function (Asset $asset) {
+            return [
+                'url' => $asset->getUrl(),
+                'alt' => (string)($asset->alt ?? ''),
+                'title' => (string)$asset->title,
+                'filename' => (string)$asset->filename,
+                'w' => $asset->getWidth(),
+                'h' => $asset->getHeight(),
+            ];
+        }, $assets);
+        return $this->asJson(['items' => $items]);
     }
 
     /**
