@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.0 - 2026-07-23
+
+### Added
+- **`GET /deon-ai/site-inventory`** — Überblick über alle Sections der Site (`handle`, `type`, `name`, `entry_count`). Der Worker kann damit erstmals selbst herausfinden, welche Seitentypen eine Kunden-Site überhaupt hat (Leistungen, Branchen, Use-Cases, Über uns, …), statt Section-Handles zu raten oder fest zu verdrahten.
+- **`GET /deon-ai/entry-sections/<id>`** — strukturierte Block-/Sektionsinhalte eines beliebigen Entries: native Matrix-Felder (Craft 5: verschachtelte Entries, Craft 4: MatrixBlocks) sowie Neo-Felder (`spicyweb/craft-neo`, falls installiert), rekursiv aufgelöst, jeweils mit Block-Typ-Handle/-Name und den einzelnen Feldwerten (Text, Bilder inkl. Alt-Text, Entry-/Category-Relationen). Feature-detected über die tatsächliche Feld-Klasse — rät nicht anhand von Feld- oder Block-Namen, da jede Kunden-Site eigene Handles verwendet. Grund: `/deon-ai/page-structure` (bisher der einzige Content-Lese-Endpoint) kennt ausschließlich das eine `deonBody`-HTML-Feld; echte, handgebaute Seiten (Startseite, Leistungsseiten, Branchenseiten) bestehen aber i. d. R. aus benannten Block-Typen (Hero, FAQ, CTA, …), nicht aus einem HTML-Blob — für diese Struktur gab es bislang keinen Lese-Pfad. Hat der Entry-Type kein Matrix-/Neo-Feld (heutiger Fall bei Deons eigenen Blog-/Standortseiten), greift `legacy_body_fallback` (identisch zu `/page-structure`), damit nichts kaputt geht, was heute schon funktioniert. Tiefen-/Blockzahl-Limit (4 Ebenen / 200 Blöcke) gegen teure, tief verschachtelte Neo-Strukturen. Beide Endpoints read-only, nicht consent-gated (wie `/pages`, `/media`, `/page-structure`). `/deon-ai/ping`-`capabilities` um `site_inventory`, `entry_sections` ergänzt.
+
 ## 0.14.0 - 2026-07-23
 
 ### Fixed

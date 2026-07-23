@@ -6,6 +6,7 @@ use Craft;
 use craft\elements\Asset;
 use craft\elements\Entry;
 use craft\fields\Assets as AssetsField;
+use craft\fields\Matrix as MatrixField;
 use craft\fields\PlainText;
 use craft\fieldlayoutelements\CustomField;
 use craft\helpers\Assets as AssetsHelper;
@@ -39,6 +40,10 @@ class ApiController extends Controller
             throw new ForbiddenHttpException('Invalid API key');
         }
     }
+
+    /** Grenzen für resolveEntrySections()/den Section-Reader — gegen teure, tief verschachtelte Neo-Strukturen. */
+    private const SECTION_READER_MAX_DEPTH = 4;
+    private const SECTION_READER_MAX_BLOCKS = 200;
 
     /** Ordnet die kurzen Berechtigungs-Keys (siehe /deon-ai/ping) den Settings-Properties zu. */
     private const PERMISSION_PROPERTIES = [
@@ -134,6 +139,7 @@ class ApiController extends Controller
                 'sitemap_discover', 'footer_links',
                 'content_replace', 'section_test', 'ab_variant_split',
                 'ab_script_inject', 'tracker_inject', 'audit_fix', 'media_inventory',
+                'site_inventory', 'entry_sections',
             ],
             'sections_ok' => [
                 'blog' => (bool)$this->sectionsService()->getSectionByHandle($settings->blogSectionHandle),
@@ -1410,6 +1416,83 @@ TWIG;
     }
 
     /**
+     * GET /deon-ai/site-inventory — Überblick über ALLE Sections der Site
+     * (Handle, Typ, Name, Entry-Anzahl). Grundlage für /deon-ai/entry-sections:
+     * der Worker muss Section-Handles einer Kunden-Site nicht raten oder
+     * vorher kennen, um z. B. eine bestehende Leistungsseite als Vorbild für
+     * eine neue zu finden. Read-only, nicht consent-gated (wie /pages, /media).
+     */
+    public function actionSiteInventory(): Response
+    {
+        $this->requireDeonKey();
+        $sections = [];
+        foreach ($this->sectionsService()->getAllSections() as $section) {
+            $sections[] = [
+                'handle' => $section->handle,
+                'type' => $section->type,
+                'name' => $section->name,
+                'entry_count' => (int)Entry::find()->sectionId($section->id)->status(null)->count(),
+            ];
+        }
+        return $this->asJson(['ok' => true, 'sections' => $sections]);
+    }
+
+    /**
+     * GET /deon-ai/entry-sections/<id> — strukturierte Block-/Sektionsinhalte
+     * eines beliebigen Entries: native Matrix-Felder (Craft 5: verschachtelte
+     * Entries, Craft 4: MatrixBlocks) sowie Neo-Felder (spicyweb/craft-neo,
+     * falls installiert), rekursiv aufgelöst. Anders als /page-structure (das
+     * nur das eine deonBody-HTML-Feld kennt) funktioniert das für JEDE Section/
+     * jeden Entry-Type der Site — echte, handgebaute Seiten bestehen i. d. R.
+     * aus benannten Block-Typen (Hero, FAQ, CTA, …), nicht aus einem HTML-Blob.
+     * Feature-detected über die tatsächliche Feld-Klasse, nicht über
+     * Feld-/Block-Namen — jede Kunden-Site kann eigene Handles verwenden.
+     * Hat der Entry-Type kein Matrix-/Neo-Feld (heutiger Fall bei Deons
+     * eigenen Blog-/Standortseiten), greift legacy_body_fallback (identisch
+     * zu /page-structure), damit nichts kaputt geht, was heute schon läuft.
+     * Read-only, nicht consent-gated (wie /page-structure).
+     */
+    public function actionEntrySections(int $id): Response
+    {
+        $this->requireDeonKey();
+        $entry = Entry::find()->id($id)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+
+        $budget = ['count' => 0];
+        $sections = $this->resolveEntrySections($entry, 0, $budget);
+
+        $section = $entry->getSection();
+        $data = [
+            'ok' => true,
+            'entry_id' => $entry->id,
+            'section_handle' => $section?->handle,
+            'entry_type' => $entry->getType()->handle,
+            'sections' => $sections,
+            'legacy_body_fallback' => null,
+        ];
+
+        if (empty($sections)) {
+            [$bodyHandle, $bodyHtml] = $this->resolveEntryBody($entry);
+            if ($bodyHandle !== null && trim($bodyHtml) !== '') {
+                $blocks = $this->contentBlocks($bodyHtml);
+                $out = [];
+                foreach ($blocks as $i => $block) {
+                    $text = trim(strip_tags($block['inner']));
+                    if ($text === '') {
+                        continue;
+                    }
+                    $out[] = ['id' => 'pc-' . $i, 'kind' => $block['kind'], 'text' => $text];
+                }
+                $data['legacy_body_fallback'] = ['body_field' => $bodyHandle, 'content_blocks' => $out];
+            }
+        }
+
+        return $this->asJson($data);
+    }
+
+    /**
      * GET /deon-ai/page-structure/<id> — kompletter Seiteninhalt zum Analysieren/
      * Nachbauen: Titel, Slug, Body-HTML, SEO-Override der URI sowie walkbare
      * Text-Blöcke (id "pc-N", Contract identisch zum WP-Plugin: h1–h3 = "title",
@@ -2097,6 +2180,246 @@ TWIG;
         }
         usort($found, static fn(array $a, array $b) => $a['pos'] - $b['pos']);
         return $found;
+    }
+
+    /**
+     * Läuft über das Field-Layout eines Entrys und liefert dessen Matrix-/
+     * Neo-Felder strukturiert (siehe actionEntrySections). Nur Matrix/Neo
+     * werden betrachtet — normale Felder des Entrys selbst (Titel, SEO,
+     * legacy Body-Feld) sind keine "Sektionen" im Sinn dieses Endpoints.
+     */
+    private function resolveEntrySections(Entry $owner, int $depth, array &$budget): array
+    {
+        if ($depth >= self::SECTION_READER_MAX_DEPTH) {
+            return [];
+        }
+        $layout = $owner->getFieldLayout();
+        if (!$layout) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($layout->getCustomFields() as $field) {
+            if ($budget['count'] >= self::SECTION_READER_MAX_BLOCKS) {
+                break;
+            }
+            try {
+                $value = $owner->getFieldValue($field->handle);
+            } catch (\Throwable $e) {
+                continue;
+            }
+            if ($field instanceof MatrixField) {
+                $out = array_merge($out, $this->resolveMatrixBlocks($field->handle, $value, $depth, $budget));
+            } elseif ($this->isNeoField($field)) {
+                $out = array_merge($out, $this->resolveNeoBlocks($field->handle, $value, $depth, $budget));
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Matrix-Blöcke eines Feldwerts auflösen. $value ist je nach Craft-Version
+     * eine EntryQuery (Craft 5, verschachtelte Entries) oder eine
+     * MatrixBlockQuery (Craft 4, MatrixBlock-Elemente) — beide liefern über
+     * all() Elemente, deren getType() ein Handle/Name-Paar hat (EntryType
+     * bzw. MatrixBlockType), daher hier bewusst ohne Versionsverzweigung.
+     */
+    private function resolveMatrixBlocks(string $fieldHandle, mixed $query, int $depth, array &$budget): array
+    {
+        if ($depth >= self::SECTION_READER_MAX_DEPTH || !is_object($query) || !method_exists($query, 'all')) {
+            return [];
+        }
+        try {
+            $blocks = $query->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $out = [];
+        foreach ($blocks as $index => $block) {
+            if ($budget['count'] >= self::SECTION_READER_MAX_BLOCKS) {
+                break;
+            }
+            $budget['count']++;
+            try {
+                $blockType = $block->getType();
+            } catch (\Throwable $e) {
+                continue;
+            }
+            $out[] = [
+                'field_handle' => $fieldHandle,
+                'block_index' => $index,
+                'block_type' => (string)($blockType->handle ?? ''),
+                'block_label' => (string)($blockType->name ?? ''),
+                'fields' => $this->resolveBlockFields($block, $depth, $budget),
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Neo-Feld (spicyweb/craft-neo, Field-Klasse benf\neo\Field) erkennen,
+     * OHNE die Klasse zu importieren — Neo ist kein Composer-Dependency
+     * dieses Plugins und auf den meisten Sites gar nicht installiert. Erst
+     * per Plugin-Handle prüfen, dann per Klassenname vergleichen, damit
+     * niemals gegen eine potenziell ungeladene Klasse geprüft wird (analog
+     * zur bestehenden CKEditor-/Redactor-Erkennung in createDeonBodyField()).
+     */
+    private function isNeoField(mixed $field): bool
+    {
+        return Craft::$app->getPlugins()->getPlugin('neo') !== null
+            && class_exists('benf\\neo\\Field')
+            && get_class($field) === 'benf\\neo\\Field';
+    }
+
+    /**
+     * Neo liefert über die Feldabfrage IMMER alle Ebenen flach (kein
+     * automatischer level-Filter) — hier auf Top-Level (level 1) einschränken,
+     * Kind-Blöcke kommen rekursiv über getChildren() dazu (siehe
+     * resolveNeoBlockList()). Fail-soft: liefert [] statt Fatal, wenn Neo
+     * intern anders reagiert als erwartet (Drittanbieter-Plugin).
+     */
+    private function resolveNeoBlocks(string $fieldHandle, mixed $query, int $depth, array &$budget): array
+    {
+        if ($depth >= self::SECTION_READER_MAX_DEPTH || !is_object($query) || !method_exists($query, 'all')) {
+            return [];
+        }
+        try {
+            $all = $query->all();
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $topLevel = array_values(array_filter($all, static function ($block) {
+            try {
+                return !isset($block->level) || (int)$block->level === 1;
+            } catch (\Throwable $e) {
+                return true;
+            }
+        }));
+        return $this->resolveNeoBlockList($fieldHandle, $topLevel, $depth, $budget);
+    }
+
+    /** Rekursiver Teil von resolveNeoBlocks() — verarbeitet eine bereits auf die richtige Ebene gefilterte Block-Liste. */
+    private function resolveNeoBlockList(string $fieldHandle, array $blocks, int $depth, array &$budget): array
+    {
+        $out = [];
+        foreach ($blocks as $index => $block) {
+            if ($budget['count'] >= self::SECTION_READER_MAX_BLOCKS) {
+                break;
+            }
+            $budget['count']++;
+            try {
+                $blockType = $block->getType();
+            } catch (\Throwable $e) {
+                continue;
+            }
+            $entry = [
+                'field_handle' => $fieldHandle,
+                'block_index' => $index,
+                'block_type' => (string)($blockType->handle ?? ''),
+                'block_label' => (string)($blockType->name ?? ''),
+                'fields' => $this->resolveBlockFields($block, $depth, $budget),
+            ];
+            try {
+                if ($depth + 1 < self::SECTION_READER_MAX_DEPTH && method_exists($block, 'getChildren')) {
+                    $children = $block->getChildren()->all();
+                    if (!empty($children)) {
+                        $childOut = $this->resolveNeoBlockList($fieldHandle, $children, $depth + 1, $budget);
+                        if (!empty($childOut)) {
+                            $entry['children'] = $childOut;
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Kind-Blöcke fail-soft weglassen, Block selbst bleibt gültig.
+            }
+            $out[] = $entry;
+        }
+        return $out;
+    }
+
+    /**
+     * Feld-Layout eines Matrix-/Neo-Blocks auflösen: normale Feldwerte per
+     * describeFieldValue(), verschachtelte Matrix-/Neo-Felder rekursiv eine
+     * Ebene tiefer. $block ist je nach Kontext ein Entry (Craft 5), ein
+     * MatrixBlock (Craft 4) oder ein Neo-Block — alle drei erweitern
+     * craft\base\Element und haben daher getFieldLayout()/getFieldValue().
+     */
+    private function resolveBlockFields(mixed $block, int $depth, array &$budget): array
+    {
+        try {
+            $layout = $block->getFieldLayout();
+        } catch (\Throwable $e) {
+            return [];
+        }
+        if (!$layout) {
+            return [];
+        }
+        $fields = [];
+        foreach ($layout->getCustomFields() as $field) {
+            try {
+                $value = $block->getFieldValue($field->handle);
+            } catch (\Throwable $e) {
+                continue;
+            }
+            if ($field instanceof MatrixField) {
+                $nested = $this->resolveMatrixBlocks($field->handle, $value, $depth + 1, $budget);
+                if (!empty($nested)) {
+                    $fields[$field->handle] = $nested;
+                }
+                continue;
+            }
+            if ($this->isNeoField($field)) {
+                $nested = $this->resolveNeoBlocks($field->handle, $value, $depth + 1, $budget);
+                if (!empty($nested)) {
+                    $fields[$field->handle] = $nested;
+                }
+                continue;
+            }
+            $fields[$field->handle] = $this->describeFieldValue($field, $value);
+        }
+        return $fields;
+    }
+
+    /**
+     * Best-effort Repräsentation eines einzelnen Block-Feldwerts.
+     * Typklassifikation über die tatsächliche Feld-Klasse, nicht über den
+     * Feld-Namen — jede Kunden-Site kann eigene Handle-Namen verwenden.
+     */
+    private function describeFieldValue(mixed $field, mixed $value): mixed
+    {
+        try {
+            if ($field instanceof AssetsField) {
+                $assets = method_exists($value, 'all') ? $value->all() : [];
+                $items = array_map(static fn(Asset $a) => [
+                    'url' => $a->getUrl(),
+                    'alt' => (string)($a->alt ?? ''),
+                ], $assets);
+                return count($items) === 1 ? $items[0] : $items;
+            }
+            if ($value instanceof \craft\elements\db\ElementQueryInterface) {
+                $items = [];
+                foreach ($value->all() as $el) {
+                    $item = ['title' => (string)($el->title ?? '')];
+                    if (method_exists($el, 'getUrl')) {
+                        try {
+                            $item['url'] = $el->getUrl();
+                        } catch (\Throwable $e) {
+                        }
+                    }
+                    $items[] = $item;
+                }
+                return count($items) === 1 ? $items[0] : $items;
+            }
+            if (is_scalar($value) || $value === null) {
+                return (string)$value;
+            }
+            if (method_exists($value, '__toString')) {
+                return (string)$value;
+            }
+            return null;
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     /**
