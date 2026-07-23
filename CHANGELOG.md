@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.0 - 2026-07-23
+
+### Fixed
+- **Kritisch: Featured Images wurden nie angehängt.** `/deon-ai/entry` und `/deon-ai/page` hängen ein Bild nur an, wenn **beide** Settings gesetzt sind — `featuredImageFieldHandle` **und** `assetVolumeHandle`. `setup-blog` hat aber ausschließlich `featuredImageFieldHandle` in den Settings verdrahtet; `assetVolumeHandle` blieb auf jeder Site leer, außer jemand hat es manuell im CP eingetragen. `hero_image_url`/`image_url` vom Worker wurde dadurch bei jedem Blog-/Seiten-Publish stillschweigend ignoriert. `setup-blog` schreibt `assetVolumeHandle` jetzt mit — für neu angelegte Felder aus dem verwendeten Volume, für bereits bestehende `deonFeaturedImage`-Felder aus deren `restrictedLocationSource` (rückwirkende Heilung von Alt-Setups, ohne das Feld anzufassen).
+- `/deon-ai/ping`s `fields_ok.featured_image` prüfte bisher nur `featuredImageFieldHandle` und meldete dadurch `true`, obwohl Bild-Uploads faktisch nie liefen. Da der Worker-Self-Heal genau dieses Flag als Gate nutzt (`setup-blog` wird nur erneut aufgerufen, wenn es `false` ist), blieb der Bug auf bereits betroffenen Sites für die automatische Reparatur dauerhaft unsichtbar. `fields_ok.featured_image` prüft jetzt zusätzlich `assetVolumeHandle` samt echter Volume-Existenz.
+
 ## 0.13.0 - 2026-07-21
 
 ### Added
