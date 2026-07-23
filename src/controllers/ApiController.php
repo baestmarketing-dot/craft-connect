@@ -318,7 +318,10 @@ class ApiController extends Controller
             'metaDescription' => isset($body['meta_description']) ? mb_substr((string)$body['meta_description'], 0, 300) : ($existing['metaDescription'] ?? null),
             'canonical' => isset($body['canonical']) ? mb_substr((string)$body['canonical'], 0, 500) : ($existing['canonical'] ?? null),
             'schemaJson' => $schemaJson ?? ($existing['schemaJson'] ?? null),
-            'enabled' => isset($body['enabled']) ? (bool)$body['enabled'] : true,
+            // Fällt auf den BESTEHENDEN Wert zurück, nicht auf true — sonst würde
+            // jedes Teil-Update (z. B. nur "title" ändern) einen bewusst deaktivierten
+            // Override stillschweigend wieder aktivieren.
+            'enabled' => isset($body['enabled']) ? (bool)$body['enabled'] : (bool)($existing['enabled'] ?? true),
             'dateUpdated' => (new \DateTime())->format('Y-m-d H:i:s'),
         ];
 
@@ -391,6 +394,12 @@ class ApiController extends Controller
         $entry = null;
         if (!empty($body['entry_id'])) {
             $entry = Entry::find()->id((int)$body['entry_id'])->status(null)->one();
+            if (!$entry) {
+                // Bewusst 404 statt still ein neues Entry anzulegen — sonst würde ein
+                // Worker-Retry mit veralteter/gelöschter entry_id (statt eines Updates)
+                // fortlaufend Duplikate erzeugen.
+                return $this->asJson(['ok' => false, 'error' => 'entry_not_found'])->setStatusCode(404);
+            }
         }
         $isNewEntry = !$entry;
         $beforeState = null;
@@ -657,8 +666,12 @@ class ApiController extends Controller
 
         $faqBlockPattern = '~<section\b[^>]*\bdata-deon-faq\b[^>]*>.*?</section>~is';
         $replacedExisting = (bool)preg_match($faqBlockPattern, $currentBody);
+        // preg_replace_callback statt preg_replace: $faqHtml als Replacement-STRING
+        // würde PHP als Backreference-Syntax interpretieren ($1, \1, ...) — enthält
+        // der generierte FAQ-Text z. B. einen Preis ("Kosten: $29/Monat"), würde "$29"
+        // stillschweigend durch einen Leerstring ersetzt (Pattern hat keine Gruppen).
         $newBody = $replacedExisting
-            ? preg_replace($faqBlockPattern, $faqHtml, $currentBody, 1)
+            ? preg_replace_callback($faqBlockPattern, static fn() => $faqHtml, $currentBody, 1)
             : $currentBody . $faqHtml;
 
         try {
@@ -721,6 +734,12 @@ class ApiController extends Controller
         $entry = null;
         if (!empty($body['entry_id'])) {
             $entry = Entry::find()->id((int)$body['entry_id'])->status(null)->one();
+            if (!$entry) {
+                // Bewusst 404 statt still ein neues Entry anzulegen — sonst würde ein
+                // Worker-Retry mit veralteter/gelöschter entry_id (statt eines Updates)
+                // fortlaufend Duplikate erzeugen.
+                return $this->asJson(['ok' => false, 'error' => 'entry_not_found'])->setStatusCode(404);
+            }
         }
         if (!$entry) {
             $entry = new Entry();
@@ -1028,32 +1047,47 @@ class ApiController extends Controller
         ]);
         $entryType->setFieldLayout($fieldLayout);
 
-        if (!$this->sectionsService()->saveEntryType($entryType)) {
-            return null;
-        }
+        // saveEntryType() und saveSection() in einer Transaktion: schlägt
+        // saveSection() fehl (z. B. Uri-Format-Konflikt), bliebe der EntryType sonst
+        // als Datenleiche mit dem Handle ("deonBlog"/"deonPages") zurück — ein
+        // erneuter setup-blog-Lauf (als idempotent dokumentiert) würde dann an der
+        // Handle-Kollision scheitern statt sich selbst zu heilen.
+        $db = Craft::$app->getDb();
+        $transaction = $db->beginTransaction();
+        try {
+            if (!$this->sectionsService()->saveEntryType($entryType)) {
+                $transaction->rollBack();
+                return null;
+            }
 
-        $siteSettings = [];
-        foreach (Craft::$app->getSites()->getAllSites() as $site) {
-            $siteSettings[] = new Section_SiteSettings([
-                'siteId' => $site->id,
-                'enabledByDefault' => true,
-                'hasUrls' => true,
-                'uriFormat' => $uriFormat,
-                'template' => $template,
-            ]);
-        }
+            $siteSettings = [];
+            foreach (Craft::$app->getSites()->getAllSites() as $site) {
+                $siteSettings[] = new Section_SiteSettings([
+                    'siteId' => $site->id,
+                    'enabledByDefault' => true,
+                    'hasUrls' => true,
+                    'uriFormat' => $uriFormat,
+                    'template' => $template,
+                ]);
+            }
 
-        $section = new Section();
-        $section->name = $name;
-        $section->handle = $handle;
-        $section->type = $type;
-        $section->setEntryTypes([$entryType]);
-        $section->setSiteSettings($siteSettings);
+            $section = new Section();
+            $section->name = $name;
+            $section->handle = $handle;
+            $section->type = $type;
+            $section->setEntryTypes([$entryType]);
+            $section->setSiteSettings($siteSettings);
 
-        if (!$this->sectionsService()->saveSection($section)) {
-            return null;
+            if (!$this->sectionsService()->saveSection($section)) {
+                $transaction->rollBack();
+                return null;
+            }
+            $transaction->commit();
+            return $section;
+        } catch (\Throwable $e) {
+            $transaction->rollBack();
+            throw $e;
         }
-        return $section;
     }
 
     private function sectionHasTemplate(Section $section): bool
@@ -1096,8 +1130,14 @@ class ApiController extends Controller
         }
 
         $outcome = $anyEmpty ? 'set' : 'fixed';
+        // Nur leere Sites befüllen, außer $force ist gesetzt — sonst würde eine
+        // Multi-Site-Section mit gemischtem Zustand (eine Site leer, eine andere
+        // mit funktionierendem Custom-Template) die funktionierende Site
+        // stillschweigend mit überschreiben, obwohl der Docblock genau das ausschließt.
         foreach ($siteSettingsList as $s) {
-            $s->template = $targetTemplate;
+            if ($force || empty($s->template)) {
+                $s->template = $targetTemplate;
+            }
         }
         $section->setSiteSettings($siteSettingsList);
         if (!$this->sectionsService()->saveSection($section)) {
@@ -3859,6 +3899,12 @@ TWIG;
                 continue; // Entry existiert nicht mehr — überspringen statt neu anzulegen (ID nicht wiederverwendbar).
             }
             $entry->title = (string)($entrySnapshot['title'] ?? $entry->title);
+            // slug fehlte hier bisher (im Gegensatz zum analogen rollbackEntry()) —
+            // der Snapshot sicherte ihn zwar, ein Restore-Point-Restore stellte die
+            // URL also nie wieder her, obwohl entries_restored fälschlich Erfolg meldete.
+            if (!empty($entrySnapshot['slug'])) {
+                $entry->slug = (string)$entrySnapshot['slug'];
+            }
             $entry->enabled = (bool)($entrySnapshot['enabled'] ?? $entry->enabled);
             if (!empty($entrySnapshot['bodyFieldHandle'])) {
                 try {

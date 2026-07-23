@@ -153,6 +153,8 @@ Optional bei jedem Schreibaufruf ein `note`-Feld mitgeben (Freitext, z. B. "Grun
 - `POST /deon-ai/faq` — `{ uri, faq_html, body_field? }`. Hängt einen FAQ-Block an den Entry-Body an (leere `uri`/`"/"` = Startseite). Idempotent: ein bereits vorhandener Block mit `data-deon-faq`-Marker wird ersetzt statt dupliziert.
 - `POST /deon-ai/page` — `{ title, slug?, body_html, status?, section?, entry_id? }`. Legt native Seiten an (Standortseiten, KI-Faktenseite). Section-Auflösung: `section`-Param → Setting `pagesSectionHandle` (Standard `pages`) → `blogSectionHandle`. Geht standardmäßig als Entwurf raus (`status` explizit `"live"` setzen für sofortige Veröffentlichung).
 
+`/deon-ai/entry` und `/deon-ai/page` legen ohne `entry_id` immer einen neuen Entry an; mit `entry_id` aktualisieren sie den bestehenden. Zeigt eine explizit übergebene `entry_id` auf keinen (mehr) existierenden Entry, liefern beide `404 { "ok": false, "error": "entry_not_found" }` statt still ein Duplikat anzulegen.
+
 Alle drei sichern den bisherigen Inhalt fail-soft in einer eigenen Tabelle, bevor sie etwas überschreiben — ein Backup-Fehler blockiert dabei nie den eigentlichen Fix.
 
 ## Sicherheit
