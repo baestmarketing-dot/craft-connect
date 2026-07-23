@@ -63,6 +63,12 @@
     id: 'allowNavEdit', name: 'allowNavEdit', on: settings.allowNavEdit,
 }) }}
 
+{{ forms.lightswitchField({
+    label: 'A/B-Tests & Tracking umkonfigurieren'|t('deon-ai-connect'),
+    instructions: 'Erlaubt Deon AI, die A/B-Test- und Tracking-Ausspielung site-weit an-/abzuschalten (/deon-ai/configure-ab, /deon-ai/configure-tracker) — wirkt sich auf alle Besucher aus, nicht nur auf einzelne Inhalte. Standardmäßig aus.'|t('deon-ai-connect'),
+    id: 'allowAbTest', name: 'allowAbTest', on: settings.allowAbTest,
+}) }}
+
 <hr>
 
 {{ forms.lightswitchField({

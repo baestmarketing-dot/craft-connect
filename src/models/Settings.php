@@ -81,11 +81,19 @@ class Settings extends Model
      */
     public bool $allowNavEdit = false;
 
+    /**
+     * Deon AI darf A/B-Test-/Tracker-Ausspielung site-weit umkonfigurieren
+     * (/deon-ai/configure-ab, /deon-ai/configure-tracker) — wirkt sich auf
+     * ALLE Besucher aus, nicht nur auf einzelne Inhalte. Standard AUS,
+     * analog zu allowNavEdit.
+     */
+    public bool $allowAbTest = false;
+
     public function defineRules(): array
     {
         return [
             [['apiKey', 'siteId', 'sdkKey', 'verificationUuid', 'blogSectionHandle', 'blogBodyFieldHandle', 'pagesSectionHandle', 'assetVolumeHandle', 'featuredImageFieldHandle'], 'string'],
-            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets', 'allowSelfUpdate', 'allowNavEdit'], 'boolean'],
+            [['injectSdk', 'manageRobotsLlms', 'allowSeoMeta', 'allowContentEdit', 'allowPageCreate', 'allowFiles', 'allowAssets', 'allowSelfUpdate', 'allowNavEdit', 'allowAbTest'], 'boolean'],
         ];
     }
 }
