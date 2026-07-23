@@ -143,7 +143,16 @@ class ApiController extends Controller
             // ein Setting kann auf einen längst gelöschten Feld-Handle zeigen.
             'fields_ok' => [
                 'body' => (bool)Craft::$app->getFields()->getFieldByHandle($settings->blogBodyFieldHandle),
-                'featured_image' => !empty($settings->featuredImageFieldHandle) && (bool)Craft::$app->getFields()->getFieldByHandle($settings->featuredImageFieldHandle),
+                // assetVolumeHandle MUSS mitgeprüft werden — /entry und /page hängen
+                // Featured Images nur an, wenn beide Settings gesetzt sind (siehe
+                // dortiges empty(featuredImageFieldHandle)||empty(assetVolumeHandle)).
+                // Ohne diese Prüfung meldet ping fälschlich true, obwohl Bild-Uploads
+                // faktisch nie ausgeführt werden — und der Worker-Self-Heal ruft
+                // setup-blog dann nie erneut auf, weil er genau dieses Flag prüft.
+                'featured_image' => !empty($settings->featuredImageFieldHandle)
+                    && (bool)Craft::$app->getFields()->getFieldByHandle($settings->featuredImageFieldHandle)
+                    && !empty($settings->assetVolumeHandle)
+                    && (bool)Craft::$app->getVolumes()->getVolumeByHandle($settings->assetVolumeHandle),
             ],
             'nav' => [
                 'verbb' => $this->isVerbbNavigationInstalled(),
@@ -823,9 +832,27 @@ class ApiController extends Controller
 
         // 2) Featured-Image-Feld — braucht ein Volume; niemals selbst eins anlegen
         // (Filesystem/Storage ist hosting-abhängig), stattdessen überspringen.
+        // $resolvedVolumeHandle wird unten in Schritt 4 in settings.assetVolumeHandle
+        // geschrieben — ohne das bleibt das Bildfeld für /entry und /page tot, weil
+        // beide zusätzlich zu featuredImageFieldHandle auch assetVolumeHandle prüfen.
         $imageField = $fieldsService->getFieldByHandle(self::DEON_IMAGE_FIELD_HANDLE);
+        $resolvedVolumeHandle = null;
         if ($imageField) {
             $result['fields']['featured_image'] = 'existing';
+            // Volume-Handle aus dem bereits existierenden Feld ableiten (heilt auch
+            // Alt-Setups, bei denen das Feld schon vor diesem Fix angelegt wurde).
+            // createDeonImageField() beschränkt über restrictLocation +
+            // restrictedLocationSource ("volume:<uid>") — NICHT über das ererbte
+            // BaseRelationField::$sources, das bleibt bei uns unangetastet auf "*".
+            if ($imageField instanceof AssetsField && $imageField->restrictLocation && !empty($imageField->restrictedLocationSource)) {
+                $source = $imageField->restrictedLocationSource;
+                if (str_starts_with($source, 'volume:')) {
+                    $vol = Craft::$app->getVolumes()->getVolumeByUid(substr($source, 7));
+                    if ($vol) {
+                        $resolvedVolumeHandle = $vol->handle;
+                    }
+                }
+            }
         } else {
             $volume = Craft::$app->getVolumes()->getAllVolumes()[0] ?? null;
             if (!$volume) {
@@ -837,6 +864,7 @@ class ApiController extends Controller
                     return $this->asJson(['ok' => false, 'error' => 'image_field_save_failed', 'details' => $imageField->getErrors()])->setStatusCode(500);
                 }
                 $result['fields']['featured_image'] = 'created';
+                $resolvedVolumeHandle = $volume->handle;
             }
         }
 
@@ -926,6 +954,9 @@ class ApiController extends Controller
         }
         if ($imageField && (empty($settings->featuredImageFieldHandle) || !$fieldsService->getFieldByHandle($settings->featuredImageFieldHandle))) {
             $updates['featuredImageFieldHandle'] = self::DEON_IMAGE_FIELD_HANDLE;
+        }
+        if ($resolvedVolumeHandle && (empty($settings->assetVolumeHandle) || !Craft::$app->getVolumes()->getVolumeByHandle($settings->assetVolumeHandle))) {
+            $updates['assetVolumeHandle'] = $resolvedVolumeHandle;
         }
         if (!empty($updates)) {
             Plugin::getInstance()->saveSettingsWithoutBootstrap($updates);
