@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.0 - 2026-07-23
+
+### Fixed
+- **`/deon-ai/faq` konnte generierten FAQ-Text stillschweigend korrumpieren.** Der FAQ-HTML-Block wurde als *Replacement*-String an `preg_replace()` übergeben — PHP interpretiert darin `$1`/`\1` etc. als Backreferences. Enthielt der generierte Text z. B. einen Preis (`"Kosten: $29/Monat"`), wurde `"$29"` durch einen Leerstring ersetzt. Jetzt über `preg_replace_callback()` eingefügt, keine Backreference-Interpretation mehr.
+- **`/deon-ai/seo` — `enabled` wurde bei jedem Teil-Update ungewollt zurückgesetzt.** Wurde ein Override zuvor bewusst deaktiviert (`enabled: false`), reaktivierte ihn jedes spätere Update von z. B. nur `title` stillschweigend wieder, weil `enabled` ohne explizites Feld im Request immer auf `true` statt auf den bestehenden Wert zurückfiel.
+- **`/deon-ai/entry` und `/deon-ai/page` legten bei ungültiger `entry_id` still ein Duplikat an.** Eine nicht mehr existierende `entry_id` (gelöschter Entry, Worker-Retry mit veralteter ID) führte zum kommentarlosen Anlegen eines komplett neuen Entries statt eines `404`. Beide Endpoints geben jetzt `404 entry_not_found` zurück, wenn eine explizit übergebene `entry_id` nicht auflösbar ist.
+- **`actionRollbackCreateRestorePoint`/`-Restore` — der Entry-`slug` wurde beim Wiederherstellen eines Sicherungspunkts nie zurückgeschrieben**, obwohl der Snapshot ihn sicherte (im Gegensatz zum korrekten Einzel-Rollback `rollbackEntry()`). Ein Restore-Point-Restore meldete Erfolg, stellte die URL aber nicht wieder her.
+- **`setup-blog` konnte auf Multi-Site-Sections funktionierende Custom-Templates überschreiben.** Hatte eine Section mindestens eine Site mit leerem Template und gleichzeitig eine andere Site mit einem funktionierenden, individuellen Custom-Template, wurden ohne `fix_template`-Flag trotzdem **alle** Site-Templates überschrieben — der eigene Docblock-Anspruch ("überschreibt nie stillschweigend eine funktionierende Custom-Konfiguration") war für diesen Fall nicht erfüllt. Jetzt werden ohne `force` nur Sites mit leerem Template befüllt.
+- **`createDeonSection()` konnte bei einem Section-Speicherfehler eine Datenleiche hinterlassen.** `saveEntryType()` und `saveSection()` liefen ohne Transaktion; schlug `saveSection()` fehl, blieb der bereits gespeicherte EntryType mit dem gewählten Handle (`deonBlog`/`deonPages`) in der DB zurück — ein erneuter `setup-blog`-Lauf scheiterte dann dauerhaft an der Handle-Kollision statt sich selbst zu heilen. Beide Saves laufen jetzt in einer gemeinsamen DB-Transaktion.
+
+Alle sechs Funde stammen aus demselben Code-Audit wie v0.16.0 (Daten-Integrität-/Robustheit-Teil der zwölf Funde).
+
 ## 0.16.0 - 2026-07-23
 
 ### Security
