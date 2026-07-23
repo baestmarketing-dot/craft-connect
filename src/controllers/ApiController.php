@@ -54,6 +54,7 @@ class ApiController extends Controller
         'assets' => 'allowAssets',
         'self_update' => 'allowSelfUpdate',
         'nav_edit' => 'allowNavEdit',
+        'ab_test' => 'allowAbTest',
     ];
 
     /** Prüft eine Berechtigung; gibt bei fehlender Freigabe die fertige 403-Response zurück, sonst null. */
@@ -172,6 +173,7 @@ class ApiController extends Controller
                 'assets' => (bool)$settings->allowAssets,
                 'self_update' => (bool)$settings->allowSelfUpdate,
                 'nav_edit' => (bool)$settings->allowNavEdit,
+                'ab_test' => (bool)$settings->allowAbTest,
             ],
         ]);
     }
@@ -293,9 +295,9 @@ class ApiController extends Controller
         $uri = '/' . ltrim((string)($body['uri'] ?? ''), '/');
         if ($uri === '/' && empty($body['allow_homepage'])) {
             // Homepage nur mit explizitem Flag — Schutz vor versehentlichem Root-Patch.
-            if (($body['uri'] ?? '') === '') {
-                return $this->asJson(['ok' => false, 'error' => 'uri required'])->setStatusCode(400);
-            }
+            // Greift unabhängig davon, ob uri fehlte oder explizit "/" gesendet wurde —
+            // beides normalisiert oben auf "/" und muss gleich behandelt werden.
+            return $this->asJson(['ok' => false, 'error' => 'homepage_requires_allow_homepage_flag'])->setStatusCode(400);
         }
 
         $schemaJson = null;
@@ -1849,7 +1851,44 @@ TWIG;
         if ($slug === '') {
             $slug = \craft\helpers\ElementHelper::generateSlug($title);
         }
-        $slug = mb_substr($slug, 0, 200);
+        $slug = mb_substr(strtolower($slug), 0, 200);
+
+        // Sicherheitskritisch: $slug wird in Plugin::init() 1:1 als Array-Key von
+        // $event->rules verwendet — das ist eine Yii-UrlManager-Rule, deren Key-Syntax
+        // Platzhalter wie "<id:\d+>" unterstützt (siehe die Kern-Routen weiter oben in
+        // derselben Datei). Ungefilterte Zeichen wären also nicht nur eine simple
+        // Kollisionsgefahr, sondern potenzielles Routing-Pattern-Injection. Deshalb
+        // strikt auf ein sicheres Segment-Alphabet beschränken, BEVOR die Reserviert-
+        // Prüfung greift.
+        if (!preg_match('/^[a-z0-9]+(?:[\/-][a-z0-9]+)*$/', $slug)) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'slug_invalid',
+                'hint' => 'Slug darf nur Kleinbuchstaben, Ziffern, "-" und "/" enthalten.',
+            ])->setStatusCode(422);
+        }
+        // Reserviert: ALLE Plugin-eigenen Routen leben unter "deon-ai/" (siehe
+        // Plugin::init()), robots.txt/llms.txt sind zwei weitere feste Top-Level-
+        // Routen. Die LP-Routen werden in Plugin::init() NACH den Kern-Routen in
+        // derselben $event->rules-Array-Instanz registriert — PHP überschreibt
+        // Array-Keys bei Kollision —, ein Slug wie "deon-ai/self-update" würde also
+        // sonst die gleichnamige Kern-Route kapern.
+        if ($slug === 'deon-ai' || str_starts_with($slug, 'deon-ai/') || $slug === 'robots.txt' || $slug === 'llms.txt') {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'slug_reserved',
+                'hint' => 'Der Slug "' . $slug . '" ist für interne Deon-AI-Routen reserviert.',
+            ])->setStatusCode(422);
+        }
+        // Kollision mit einer bestehenden, echten Craft-Seite vermeiden — Site-URL-
+        // Rules (inkl. dieser LP-Route) greifen vor der regulären Element-URI-Auflösung.
+        if (Entry::find()->uri($slug)->status(null)->exists()) {
+            return $this->asJson([
+                'ok' => false,
+                'error' => 'slug_collides_with_entry',
+                'hint' => 'Unter "/' . $slug . '" existiert bereits ein Craft-Entry.',
+            ])->setStatusCode(422);
+        }
 
         $db = Craft::$app->getDb();
         $table = '{{%deonai_landing_pages}}';
@@ -2911,6 +2950,14 @@ TWIG;
             try {
                 switch ($type) {
                     case 'seo_meta':
+                        // actionPublishWinner() selbst prüft nur 'content_edit' — SEO-Overrides
+                        // laufen sonst ausschließlich über actionSetSeo() hinter 'seo_meta'.
+                        // Ohne diesen Check könnte 'content_edit' allein (ohne 'seo_meta')
+                        // trotzdem SEO-Title/-Description überschreiben.
+                        if (empty(Plugin::getInstance()->getSettings()->allowSeoMeta)) {
+                            $errors[] = 'seo_meta: consent_required';
+                            break;
+                        }
                         $fields = [];
                         if (isset($change['title'])) {
                             $fields['title'] = mb_substr((string)$change['title'], 0, 200);
@@ -3113,6 +3160,9 @@ TWIG;
     public function actionConfigureAb(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('ab_test')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
         $config = Plugin::getInstance()->getJsonConfig('ab_config');
@@ -3151,6 +3201,9 @@ TWIG;
     public function actionConfigureTracker(): Response
     {
         $this->requireDeonKey();
+        if ($response = $this->checkPermission('ab_test')) {
+            return $response;
+        }
         $this->requirePostRequest();
         $body = Craft::$app->getRequest()->getBodyParams();
         $config = Plugin::getInstance()->getJsonConfig('tracker_config');
@@ -3912,11 +3965,24 @@ TWIG;
             return null;
         }
 
+        // TOCTOU-/DNS-Rebinding-Schutz: die oben geprüfte IP wird für die TATSÄCHLICHE
+        // Verbindung verwendet, statt den Hostnamen bei file_get_contents() erneut
+        // auflösen zu lassen — sonst könnte ein Angreifer mit kurzer DNS-TTL zwischen
+        // Check und Fetch auf eine private/interne IP umschwenken und die Prüfung
+        // oben wäre wirkungslos. "Host"-Header + ssl.peer_name halten virtuelles
+        // Hosting bzw. TLS-Zertifikatsprüfung trotzdem korrekt (validiert gegen den
+        // echten Hostnamen, nicht gegen die IP).
+        $authority = (str_contains($ip, ':') ? '[' . $ip . ']' : $ip) . (isset($parts['port']) ? ':' . $parts['port'] : '');
+        $pinnedUrl = $scheme . '://' . $authority
+            . ($parts['path'] ?? '')
+            . (isset($parts['query']) ? '?' . $parts['query'] : '')
+            . (isset($parts['fragment']) ? '#' . $parts['fragment'] : '');
+
         $context = stream_context_create([
-            'http' => ['timeout' => 15, 'follow_location' => 0],
-            'https' => ['timeout' => 15, 'follow_location' => 0],
+            'http' => ['timeout' => 15, 'follow_location' => 0, 'header' => "Host: $host\r\n"],
+            'ssl' => ['peer_name' => $host],
         ]);
-        $bytes = @file_get_contents($url, false, $context, 0, $maxBytes + 1);
+        $bytes = @file_get_contents($pinnedUrl, false, $context, 0, $maxBytes + 1);
         if ($bytes === false || strlen($bytes) > $maxBytes) {
             return null;
         }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.0 - 2026-07-23
+
+### Security
+- **`/deon-ai/publish-lp` — Slug ohne Zeichen-Whitelist konnte Kern-Routen kapern.** Der Slug wurde in `Plugin::init()` 1:1 als Array-Key einer Yii-`UrlManager`-Rule verwendet, deren Key-Syntax Platzhalter wie `<id:\d+>` unterstützt — ungefiltert also nicht nur eine Kollisionsgefahr, sondern potenzielles Routing-Pattern-Injection. Da die LP-Routen in derselben `$event->rules`-Array-Instanz **nach** allen Kern-Routen registriert werden (PHP überschreibt Array-Keys bei Kollision), konnte ein Slug wie `"deon-ai/self-update"` die gleichnamige Kern-Route kapern. Slug jetzt strikt auf `[a-z0-9-/]` beschränkt, gegen die `deon-ai/*`-Reserved-Liste sowie gegen bestehende Entry-URIs geprüft.
+- **`/deon-ai/seo` — Homepage-Schutz war wirkungslos.** Die Klausel "Homepage nur mit explizitem `allow_homepage`-Flag" griff nur, wenn `uri` komplett fehlte — ein Request mit `{"uri":"/"}` (ohne das Flag) überschrieb die Homepage-SEO trotzdem. Jetzt greift der Schutz unabhängig vom Rohwert, sobald die normalisierte URI `/` ist.
+- **`/deon-ai/configure-ab` und `/deon-ai/configure-tracker` hatten gar keine Berechtigungsprüfung.** Jeder gültige API-Key konnte A/B-Testing/Tracking site-weit an-/abschalten, ohne dass es dafür einen Consent-Schalter gab. Neue Berechtigung `allowAbTest` (Default aus) gattert jetzt beide Endpoints; CP-Settings um den entsprechenden Schalter ergänzt.
+- **`/deon-ai/publish-winner` konnte SEO-Overrides ohne `seo_meta`-Freigabe schreiben.** Die Methode prüfte nur `content_edit`, ihr `seo_meta`-Change-Type schrieb aber direkt in dieselbe Tabelle, die `/deon-ai/seo` nur nach separater `seo_meta`-Freigabe beschreiben darf. Wird jetzt zusätzlich geprüft; fehlt die Freigabe, wird der `seo_meta`-Change übersprungen (`errors: ["seo_meta: consent_required"]"`) statt den Rest des Requests abzubrechen.
+- **`fetchUrlBytes()` (Bild-URL-Fetch für Featured Images/Asset-Uploads) war per DNS-Rebinding gegen den SSRF-Schutz umgehbar.** Der Host wurde per `gethostbyname()` gegen private/reservierte IP-Ranges geprüft, der eigentliche Fetch löste den Hostnamen aber erneut auf — bei kurzer TTL könnte der DNS-Eintrag zwischen Check und Fetch auf eine interne IP wechseln (TOCTOU). Die geprüfte IP wird jetzt direkt für die Verbindung verwendet (`Host`-Header + `ssl.peer_name` halten virtuelles Hosting/TLS-Zertifikatsprüfung weiterhin korrekt).
+
+Alle fünf Funde stammen aus einem vollständigen Code-Audit der Plugin-Funktionen gegen echten Craft-Core-/Neo-Plugin-Quellcode. Nicht übernommen: der Befund "Rollback-Restore-Endpoints ohne Berechtigungsprüfung" — das ist laut README (Zeile 65) bewusstes Design ("Rückgängig machen funktioniert unabhängig von diesen Schaltern immer"), kein Bug.
+
 ## 0.15.0 - 2026-07-23
 
 ### Added
