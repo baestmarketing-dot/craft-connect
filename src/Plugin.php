@@ -119,6 +119,9 @@ class Plugin extends BasePlugin
                 $event->rules['deon-ai/audit-fix'] = 'deon-ai-connect/api/audit-fix';
                 // v0.13.0 — Asset-Bibliothek für Bild-Matching (Pendant zu WP wp-json/wp/v2/media)
                 $event->rules['deon-ai/media'] = 'deon-ai-connect/api/media';
+                // v0.15.0 — Site-weiter Section-Reader (Matrix/Neo statt nur deonBody)
+                $event->rules['deon-ai/site-inventory'] = 'deon-ai-connect/api/site-inventory';
+                $event->rules['deon-ai/entry-sections/<id:\d+>'] = 'deon-ai-connect/api/entry-sections';
 
                 // Full-Page-Landingpages (/deon-ai/publish-lp): eine Route pro
                 // aktivem Slug. Fail-soft: Tabelle existiert vor der Migration
