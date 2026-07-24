@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.0 - 2026-07-24
+
+### Added
+- **`POST /deon-ai/entry-sections/<id>`** — Text-Werte in nativen Matrix-/Neo-Blöcken patchen (dieselbe Route wie der bestehende `GET`-Read, per HTTP-Methode verzweigt). Body: `{ patches: [{ field_handle, block_id?, block_index?, field, value }] }`. Schließt die im "Kopieren & Umbauen"-Konzept beschriebene Lücke: `/duplicate-page` klont eine Seite bereits strukturell perfekt (native `duplicateElement()`, inkl. aller Matrix-/Neo-Blöcke im Original-Theme-Template), aber bisher gab es keinen Weg, den Text in diesen geklonten Blöcken für die neue Seite (z. B. eine andere Stadt/Leistung) zu ersetzen — nur das eine Legacy-`deonBody`-HTML-Feld war beschreibbar. Schreibt bewusst nur "textartige" Felder (PlainText/CKEditor/Redactor sowie jedes Feld mit einfachem **String**-Wert — bewusst `is_string()` statt `is_scalar()`, sonst wären auch Number-/Lightswitch-/Date-Felder fälschlich als "textartig" durchgerutscht) — Assets/Relationen/verschachtelte Matrix-Neo-Felder werden nie angefasst. Gate: `content_edit` (dieselbe Freigabe wie `/deon-ai/faq`). Jeder Patch wird einzeln im Change-Log erfasst und ist über `/deon-ai/rollback` einzeln rückgängig machbar (`rollbackEntrySection()`, Ziel-Typ `entry-section`).
+- `GET /deon-ai/entry-sections/<id>` liefert pro Block jetzt zusätzlich `block_id` (stabile Element-ID, nicht nur der positionsabhängige `block_index`) — Voraussetzung für zuverlässiges Patchen nach einem separaten Read. Bei genesteten Neo-Blöcken `block_id` statt `block_index` verwenden (`block_index` zählt beim GET pro Verschachtelungsebene neu bei 0, beim POST-Fallback indiziert er die flache Blockliste — beide Nummerierungen sind bei genesteten Neo-Strukturen nicht deckungsgleich; für Matrix und flache Neo-Strukturen kein Unterschied).
+
 ## 0.17.0 - 2026-07-23
 
 ### Fixed

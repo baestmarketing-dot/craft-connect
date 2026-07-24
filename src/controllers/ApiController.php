@@ -1459,21 +1459,30 @@ TWIG;
 
     /**
      * GET /deon-ai/site-inventory — Überblick über ALLE Sections der Site
-     * (Handle, Typ, Name, Entry-Anzahl). Grundlage für /deon-ai/entry-sections:
-     * der Worker muss Section-Handles einer Kunden-Site nicht raten oder
-     * vorher kennen, um z. B. eine bestehende Leistungsseite als Vorbild für
-     * eine neue zu finden. Read-only, nicht consent-gated (wie /pages, /media).
+     * (Handle, Typ, Name, Entry-Anzahl, eine Beispiel-Entry-ID). Grundlage für
+     * /deon-ai/entry-sections: der Worker muss Section-Handles einer Kunden-
+     * Site nicht raten oder vorher kennen, um z. B. eine bestehende
+     * Leistungsseite als Vorbild für eine neue zu finden. Read-only, nicht
+     * consent-gated (wie /pages, /media).
+     *
+     * v0.18.0: `sample_entry_id` ergänzt — der bisherige Response hatte KEINE
+     * konkrete Entry-ID pro Section, sodass ein Aufrufer trotz Section-Liste
+     * keinen Entry für GET /entry-sections/<id> wählen konnte. Neuester Entry
+     * (dateUpdated DESC) je Section, damit Copy-&-Rebuild-Vorlagen tendenziell
+     * den aktuell gepflegten Content abbilden statt einer alten Erstanlage.
      */
     public function actionSiteInventory(): Response
     {
         $this->requireDeonKey();
         $sections = [];
         foreach ($this->sectionsService()->getAllSections() as $section) {
+            $sample = Entry::find()->sectionId($section->id)->status(null)->orderBy(['dateUpdated' => SORT_DESC])->one();
             $sections[] = [
                 'handle' => $section->handle,
                 'type' => $section->type,
                 'name' => $section->name,
                 'entry_count' => (int)Entry::find()->sectionId($section->id)->status(null)->count(),
+                'sample_entry_id' => $sample ? (int)$sample->id : null,
             ];
         }
         return $this->asJson(['ok' => true, 'sections' => $sections]);
@@ -1493,10 +1502,22 @@ TWIG;
      * eigenen Blog-/Standortseiten), greift legacy_body_fallback (identisch
      * zu /page-structure), damit nichts kaputt geht, was heute schon läuft.
      * Read-only, nicht consent-gated (wie /page-structure).
+     *
+     * v0.18.0: Dieselbe Route bedient jetzt zusätzlich POST — "Kopieren &
+     * Umbauen" (echtes Theme-Duplikat via /duplicate-page + native Matrix-/
+     * Neo-Blöcke) braucht einen Weg, den geklonten Blöcken NEUEN Text zu
+     * geben, statt den Original-Text 1:1 stehen zu lassen. Kein Merge-Konflikt
+     * mit der GET-Semantik: Yii-Controller-Actions dispatchen pro Request,
+     * nicht pro Methode — hier bewusst manuell verzweigt statt eine zweite
+     * URL-Regel anzulegen, damit bestehende Worker-Aufrufe (GET) unverändert
+     * funktionieren, ohne Plugin.php anzufassen.
      */
     public function actionEntrySections(int $id): Response
     {
         $this->requireDeonKey();
+        if (Craft::$app->getRequest()->getIsPost()) {
+            return $this->applyEntrySectionPatches($id);
+        }
         $entry = Entry::find()->id($id)->status(null)->one();
         if (!$entry) {
             return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
@@ -1532,6 +1553,204 @@ TWIG;
         }
 
         return $this->asJson($data);
+    }
+
+    /**
+     * POST /deon-ai/entry-sections/<id> — Text-Werte in nativen Matrix-/Neo-
+     * Blöcken patchen (Gegenstück zum GET-Read oben). Body:
+     * { patches: [{ field_handle, block_id?, block_index?, field, value }] }.
+     * block_id (aus einem vorherigen GET-Read) wird bevorzugt; block_index ist
+     * der Fallback für Aufrufer, die direkt nach einem /duplicate-page-Klon
+     * patchen, ohne zwischendurch erneut zu lesen (Index ist innerhalb
+     * DESSELBEN Entry-Zustands stabil, da /duplicate-page die Blockreihenfolge
+     * des Quell-Entries 1:1 übernimmt).
+     * ACHTUNG bei Neo mit verschachtelten (Kind-)Blöcken: block_index hier
+     * indiziert die FLACHE $blockQuery->all()-Liste (alle Ebenen), während
+     * resolveNeoBlockList() beim GET-Read pro Verschachtelungsebene neu bei 0
+     * zählt (block_index dort ist relativ zum jeweiligen Eltern-Level) — die
+     * beiden Nummerierungen sind bei genesteten Neo-Strukturen NICHT
+     * deckungsgleich. Für Matrix-Felder und flache (unverschachtelte)
+     * Neo-Strukturen ist das kein Unterschied. Bei genesteten Neo-Blöcken
+     * daher immer block_id verwenden, nicht block_index.
+     *
+     * Schreibt bewusst NUR "textartige" Felder (PlainText/CKEditor/Redactor
+     * bzw. jedes Feld, dessen aktueller Wert bereits ein einfacher String ist)
+     * — Assets-/Relations-/verschachtelte Matrix-Neo-Felder werden NIE
+     * angefasst (siehe isWritableTextField()), damit ein Copy-&-Rebuild-Call
+     * niemals Bild-Zuordnungen oder Verknüpfungen zerstören kann.
+     *
+     * Gate: content_edit (dieselbe Freigabe wie /deon-ai/faq — beide ändern
+     * den Inhalt bestehender/geklonter Entries, nicht neue Seiten anlegen).
+     * Jeder Patch wird einzeln im Change-Log erfasst (targetType
+     * "entry-section", targetKey "<entryId>:<fieldHandle>:<blockId>") —
+     * granulares Rollback pro Block-Feld statt nur pro ganzem Entry.
+     */
+    private function applyEntrySectionPatches(int $id): Response
+    {
+        if ($response = $this->checkPermission('content_edit')) {
+            return $response;
+        }
+        $entry = Entry::find()->id($id)->status(null)->one();
+        if (!$entry) {
+            return $this->asJson(['ok' => false, 'error' => 'not_found'])->setStatusCode(404);
+        }
+
+        $body = Craft::$app->getRequest()->getBodyParams();
+        $patches = is_array($body['patches'] ?? null) ? $body['patches'] : [];
+        if (empty($patches)) {
+            return $this->asJson(['ok' => false, 'error' => 'patches[] erforderlich'])->setStatusCode(400);
+        }
+        // Batch-Obergrenze — analog zu SECTION_READER_MAX_BLOCKS, gegen versehentliche/böswillige Massen-Writes.
+        $patches = array_slice($patches, 0, 50);
+
+        $layout = $entry->getFieldLayout();
+        if (!$layout) {
+            return $this->asJson(['ok' => false, 'error' => 'no_field_layout'])->setStatusCode(422);
+        }
+        $topFields = [];
+        foreach ($layout->getCustomFields() as $f) {
+            $topFields[$f->handle] = $f;
+        }
+
+        $applied = [];
+        $errors = [];
+        foreach ($patches as $i => $patch) {
+            if (!is_array($patch)) {
+                $errors[] = ['index' => $i, 'error' => 'invalid_patch'];
+                continue;
+            }
+            $fieldHandle = (string)($patch['field_handle'] ?? '');
+            $subField = (string)($patch['field'] ?? '');
+            $value = $patch['value'] ?? null;
+            $blockId = isset($patch['block_id']) ? (int)$patch['block_id'] : 0;
+            $blockIndex = isset($patch['block_index']) ? (int)$patch['block_index'] : null;
+
+            if ($fieldHandle === '' || $subField === '' || !is_string($value)) {
+                $errors[] = ['index' => $i, 'error' => 'field_handle, field und value (string) erforderlich'];
+                continue;
+            }
+            $topField = $topFields[$fieldHandle] ?? null;
+            // Null-Guard zuerst: isNeoField() ruft intern get_class($field) auf, was in PHP 8
+            // einen TypeError wirft, wenn $field null ist (unbekanntes field_handle).
+            if ($topField === null || (!$topField instanceof MatrixField && !$this->isNeoField($topField))) {
+                $errors[] = ['index' => $i, 'error' => 'field_handle_not_matrix_or_neo', 'field_handle' => $fieldHandle];
+                continue;
+            }
+
+            try {
+                $blockQuery = $entry->getFieldValue($fieldHandle);
+                $blocks = (is_object($blockQuery) && method_exists($blockQuery, 'all')) ? $blockQuery->all() : [];
+            } catch (\Throwable $e) {
+                $errors[] = ['index' => $i, 'error' => 'block_query_failed', 'field_handle' => $fieldHandle];
+                continue;
+            }
+
+            $target = null;
+            if ($blockId > 0) {
+                foreach ($blocks as $b) {
+                    if ((int)($b->id ?? 0) === $blockId) {
+                        $target = $b;
+                        break;
+                    }
+                }
+            }
+            if ($target === null && $blockIndex !== null && isset($blocks[$blockIndex])) {
+                $target = $blocks[$blockIndex];
+            }
+            if ($target === null) {
+                $errors[] = ['index' => $i, 'error' => 'block_not_found', 'field_handle' => $fieldHandle, 'block_id' => $blockId, 'block_index' => $blockIndex];
+                continue;
+            }
+
+            try {
+                $blockLayout = $target->getFieldLayout();
+                $blockField = null;
+                if ($blockLayout) {
+                    foreach ($blockLayout->getCustomFields() as $bf) {
+                        if ($bf->handle === $subField) {
+                            $blockField = $bf;
+                            break;
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                $blockField = null;
+            }
+            if ($blockField === null) {
+                $errors[] = ['index' => $i, 'error' => 'sub_field_not_found', 'field_handle' => $fieldHandle, 'field' => $subField];
+                continue;
+            }
+            if (!$this->isWritableTextField($blockField, $target)) {
+                $errors[] = ['index' => $i, 'error' => 'field_not_text_writable', 'field_handle' => $fieldHandle, 'field' => $subField];
+                continue;
+            }
+
+            $before = $this->describeFieldValue($blockField, $target->getFieldValue($subField));
+            try {
+                $target->setFieldValue($subField, $value);
+            } catch (\Throwable $e) {
+                $errors[] = ['index' => $i, 'error' => 'set_field_value_failed', 'message' => $e->getMessage()];
+                continue;
+            }
+            if (!Craft::$app->getElements()->saveElement($target)) {
+                $errors[] = ['index' => $i, 'error' => 'save_failed', 'details' => $target->getErrors()];
+                continue;
+            }
+
+            $realBlockId = (int)($target->id ?? $blockId);
+            $this->logChange(
+                'entry-section',
+                $id . ':' . $fieldHandle . ':' . $realBlockId . ':' . $subField,
+                ['value' => $before],
+                ['value' => $value],
+                'entry-sections-patch'
+            );
+            $applied[] = [
+                'field_handle' => $fieldHandle,
+                'block_id' => $realBlockId,
+                'field' => $subField,
+            ];
+        }
+
+        return $this->asJson([
+            'ok' => !empty($applied),
+            'applied' => $applied,
+            'applied_count' => count($applied),
+            'errors' => $errors,
+            'plugin_version' => Plugin::getInstance()->getVersion(),
+        ]);
+    }
+
+    /**
+     * Darf ein Block-Feld per /entry-sections-POST beschrieben werden? JA für
+     * PlainText/CKEditor/Redactor (Klassen-Vergleich, gleiches Muster wie
+     * createDeonBodyField()) sowie für jedes andere Feld, dessen AKTUELLER
+     * Wert bereits als einfacher String durchkommt (describeFieldValue()) —
+     * das deckt z. B. simple Textarea-artige Drittanbieter-Felder ab, ohne
+     * jede Feld-Klasse einzeln zu kennen. NEIN für Assets/Relationen/
+     * verschachtelte Matrix-Neo-Felder (describeFieldValue() liefert dort
+     * Arrays/Objekte oder die Klasse ist explizit ausgeschlossen) — ein
+     * Copy-&-Rebuild-Call darf niemals Bild-Zuordnungen oder Verknüpfungen
+     * überschreiben, nur Fließtext.
+     */
+    private function isWritableTextField(mixed $field, mixed $block): bool
+    {
+        if ($field instanceof AssetsField || $field instanceof MatrixField || $this->isNeoField($field)) {
+            return false;
+        }
+        $cls = get_class($field);
+        if ($field instanceof PlainText || $cls === 'craft\\ckeditor\\Field' || $cls === 'craft\\redactor\\Field') {
+            return true;
+        }
+        try {
+            $current = $block->getFieldValue($field->handle);
+        } catch (\Throwable $e) {
+            return false;
+        }
+        // is_string() statt is_scalar(): Number-/Lightswitch-/Date-artige Felder haben
+        // ebenfalls skalare Werte (int/float/bool), sind aber keine "textartigen" Felder
+        // im Sinne dieses Endpoints (siehe CHANGELOG: "einfacher String-Wert").
+        return is_string($current) || $current === null;
     }
 
     /**
@@ -2327,6 +2546,9 @@ TWIG;
             $out[] = [
                 'field_handle' => $fieldHandle,
                 'block_index' => $index,
+                // v0.18.0: stabile Element-ID für /entry-sections-Writes (POST) — block_index
+                // ist nur innerhalb EINES Reads stabil, block_id bleibt über Requests hinweg gültig.
+                'block_id' => (int)($block->id ?? 0),
                 'block_type' => (string)($blockType->handle ?? ''),
                 'block_label' => (string)($blockType->name ?? ''),
                 'fields' => $this->resolveBlockFields($block, $depth, $budget),
@@ -2394,6 +2616,8 @@ TWIG;
             $entry = [
                 'field_handle' => $fieldHandle,
                 'block_index' => $index,
+                // v0.18.0: stabile Element-ID für /entry-sections-Writes (POST), siehe resolveMatrixBlocks().
+                'block_id' => (int)($block->id ?? 0),
                 'block_type' => (string)($blockType->handle ?? ''),
                 'block_label' => (string)($blockType->name ?? ''),
                 'fields' => $this->resolveBlockFields($block, $depth, $budget),
@@ -3618,6 +3842,7 @@ TWIG;
                 'seo_override' => $this->rollbackSeoOverride($log['targetKey'], $before),
                 'hygiene' => $this->rollbackHygiene($log['targetKey'], $before),
                 'entry' => $this->rollbackEntry($log['targetKey'], $before),
+                'entry-section' => $this->rollbackEntrySection($log['targetKey'], $before),
                 'restore_point' => $this->restoreSnapshot(json_decode($log['afterJson'], true) ?: []),
                 'section_template' => $this->rollbackSectionTemplate($log['targetKey'], $before),
                 default => ['ok' => false, 'error' => 'unknown_target_type'],
@@ -3690,6 +3915,7 @@ TWIG;
         'seo_override' => 'SEO-Override',
         'hygiene' => 'robots.txt/llms.txt',
         'entry' => 'Blog-Entry',
+        'entry-section' => 'Block-Feld',
         'restore_point' => 'Sicherungspunkt',
         'section_template' => 'Section-Template',
     ];
@@ -3852,6 +4078,55 @@ TWIG;
 
         if (!Craft::$app->getElements()->saveElement($entry)) {
             return ['ok' => false, 'error' => 'save_failed', 'details' => $entry->getErrors()];
+        }
+        return ['ok' => true, 'action' => 'restored'];
+    }
+
+    /**
+     * Rollback eines einzelnen /entry-sections-Patches (siehe
+     * applyEntrySectionPatches()). targetKey-Format: "<entryId>:<fieldHandle>:
+     * <blockId>:<subField>" (aus logChange() dort). Sucht den Block über
+     * dieselbe block_id-Logik wie beim Schreiben — nicht über block_index,
+     * der nur innerhalb EINES Reads stabil ist.
+     */
+    private function rollbackEntrySection(string $targetKey, ?array $before): array
+    {
+        $parts = explode(':', $targetKey, 4);
+        if (count($parts) !== 4 || $before === null || !array_key_exists('value', $before)) {
+            return ['ok' => false, 'error' => 'invalid_rollback_target'];
+        }
+        [$entryId, $fieldHandle, $blockId, $subField] = $parts;
+
+        $entry = Entry::find()->id((int)$entryId)->status(null)->one();
+        if (!$entry) {
+            return ['ok' => false, 'error' => 'entry_no_longer_exists'];
+        }
+
+        try {
+            $blockQuery = $entry->getFieldValue($fieldHandle);
+            $blocks = (is_object($blockQuery) && method_exists($blockQuery, 'all')) ? $blockQuery->all() : [];
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'block_query_failed'];
+        }
+
+        $target = null;
+        foreach ($blocks as $b) {
+            if ((int)($b->id ?? 0) === (int)$blockId) {
+                $target = $b;
+                break;
+            }
+        }
+        if ($target === null) {
+            return ['ok' => false, 'error' => 'block_no_longer_exists'];
+        }
+
+        try {
+            $target->setFieldValue($subField, (string)$before['value']);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'error' => 'set_field_value_failed'];
+        }
+        if (!Craft::$app->getElements()->saveElement($target)) {
+            return ['ok' => false, 'error' => 'save_failed', 'details' => $target->getErrors()];
         }
         return ['ok' => true, 'action' => 'restored'];
     }
